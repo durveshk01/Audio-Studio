@@ -5,7 +5,18 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "dist/client",
-    emptyOutDir: true
+    emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id: string) {
+          if (id.includes("node_modules")) {
+            if (id.includes("lucide-react")) return "icons";
+            if (id.includes("react") || id.includes("react-dom")) return "vendor";
+            if (id.includes("jszip") || id.includes("browser-id3-writer")) return "audio-libs";
+          }
+        }
+      }
+    }
   },
   server: {
     proxy: {

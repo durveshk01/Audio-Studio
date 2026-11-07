@@ -1,6 +1,15 @@
 # Audio Studio — Professional Device-Powered Audio Workstation
 
+[![CI/CD Pipeline](https://github.com/durveshk01/Audio-Studio/actions/workflows/ci.yml/badge.svg)](https://github.com/durveshk01/Audio-Studio/actions/workflows/ci.yml)
+[![Vercel Deployment](https://img.shields.io/badge/Vercel-Live%20App-000000?logo=vercel)](https://audio-studio-eosin.vercel.app)
+[![GitHub Release](https://img.shields.io/badge/Release-v2.0.0-blue?logo=github)](https://github.com/durveshk01/Audio-Studio/releases/tag/v2.0.0)
+[![Android APK](https://img.shields.io/badge/Download-Android%20APK%20(4.45MB)-brightgreen?logo=android)](https://github.com/durveshk01/Audio-Studio/releases/download/v2.0.0/Audio-Studio-Release.apk)
+
 Audio Studio is a modern, high-performance audio editing, compression, metadata tagging, and analysis workstation designed with a **Device-First, Hardware-Accelerated Architecture**.
+
+🔗 **Live Production Web App**: [https://audio-studio-eosin.vercel.app](https://audio-studio-eosin.vercel.app)  
+📥 **Android APK Download**: [Audio-Studio-Release.apk (v2.0.0)](https://github.com/durveshk01/Audio-Studio/releases/download/v2.0.0/Audio-Studio-Release.apk)  
+🔑 **APK SHA-256**: `181A41B3491E4091174D92B707862B87394F816884C9E93AD08035421C06F048`
 
 > **Important Architecture Principle**: The user's mobile device or desktop browser performs 100% of the actual audio processing (decoding, resampling, compression, trimming, tagging, waveform analysis, and packaging) locally using native CPU/DSP hardware capabilities. Audio files are never sent to remote cloud servers for core operations.
 
