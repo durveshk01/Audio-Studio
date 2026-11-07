@@ -16,3 +16,5 @@ metatune/outputs/*
 artifacts/
 *.apk
 
+
+.vercel
