@@ -40,7 +40,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <aside className="app-sidebar">
-      <nav className="sidebar-nav">
+      <nav className="sidebar-nav" aria-label="Studio navigation">
         {navItems.map((item) => {
           const Icon = item.icon;
           const isActive = activeTab === item.id;
@@ -50,6 +50,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               type="button"
               className={`sidebar-link ${isActive ? "active" : ""}`}
               onClick={() => onSelectTab(item.id)}
+              aria-current={isActive ? "page" : undefined}
             >
               <Icon size={18} />
               <span>{item.label}</span>
@@ -63,7 +64,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="privacy-pill">
           <ShieldCheck size={16} className="text-success" />
           <div>
-            <strong>100% Private</strong>
+            <strong>Local Audio Workflows</strong>
             <small>Audio stays on your device</small>
           </div>
         </div>
@@ -71,7 +72,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {isNative ? (
           <div className="device-spec-box">
             <Smartphone size={14} />
-            <span>Android Hardware Mode</span>
+            <span>Android Local Audio</span>
           </div>
         ) : null}
       </div>

@@ -1,156 +1,166 @@
-# Audio Studio — Professional Device-Powered Audio Workstation
+# Audio Studio — Device-Powered Audio Workstation
 
-[![CI/CD Pipeline](https://github.com/durveshk01/Audio-Studio/actions/workflows/ci.yml/badge.svg)](https://github.com/durveshk01/Audio-Studio/actions/workflows/ci.yml)
-[![Vercel Deployment](https://img.shields.io/badge/Vercel-Live%20App-000000?logo=vercel)](https://audio-studio-eosin.vercel.app)
-[![GitHub Release](https://img.shields.io/badge/Release-v2.0.0-blue?logo=github)](https://github.com/durveshk01/Audio-Studio/releases/tag/v2.0.0)
-[![Android APK](https://img.shields.io/badge/Download-Android%20APK%20(4.45MB)-brightgreen?logo=android)](https://github.com/durveshk01/Audio-Studio/releases/download/v2.0.0/Audio-Studio-Release.apk)
+[![CI](https://github.com/durveshk01/Audio-Studio/actions/workflows/ci.yml/badge.svg)](https://github.com/durveshk01/Audio-Studio/actions/workflows/ci.yml)
+[![Web App](https://img.shields.io/badge/Web-Open%20Studio-000000?logo=vercel)](https://audio-studio-eosin.vercel.app)
+[![Release](https://img.shields.io/badge/Release-v2.1.0-blue?logo=github)](https://github.com/durveshk01/Audio-Studio/releases/tag/v2.1.0)
+[![Android APK](https://img.shields.io/badge/Download-Android%20APK-brightgreen?logo=android)](https://github.com/durveshk01/Audio-Studio/releases/download/v2.1.0/Audio-Studio-Release.apk)
 
-Audio Studio is a modern, high-performance audio editing, compression, metadata tagging, and analysis workstation designed with a **Device-First, Hardware-Accelerated Architecture**.
+Audio Studio provides local audio compression, MP3/M4A tagging, cover design, analysis, trimming, playback, and a persistent music library.
 
-🔗 **Live Production Web App**: [https://audio-studio-eosin.vercel.app](https://audio-studio-eosin.vercel.app)  
-📥 **Android APK Download**: [Audio-Studio-Release.apk (v2.0.0)](https://github.com/durveshk01/Audio-Studio/releases/download/v2.0.0/Audio-Studio-Release.apk)  
-🔑 **APK SHA-256**: `181A41B3491E4091174D92B707862B87394F816884C9E93AD08035421C06F048`
+- **Android:** bundled offline application; core operations use the phone's CPU and Android media codecs. The signed release has no Internet permission.
+- **Web:** audio processing runs in the browser. An optional, explicitly configured backend supports metadata-index uploads and online artwork generation.
 
-> **Important Architecture Principle**: The user's mobile device or desktop browser performs 100% of the actual audio processing (decoding, resampling, compression, trimming, tagging, waveform analysis, and packaging) locally using native CPU/DSP hardware capabilities. Audio files are never sent to remote cloud servers for core operations.
+## Download
 
----
+- [Android APK — v2.1.0](https://github.com/durveshk01/Audio-Studio/releases/download/v2.1.0/Audio-Studio-Release.apk)
+- [APK SHA-256 checksum](https://github.com/durveshk01/Audio-Studio/releases/download/v2.1.0/Audio-Studio-Release.apk.sha256)
+- [Release notes and verification evidence](https://github.com/durveshk01/Audio-Studio/releases/tag/v2.1.0)
+- [Open the web studio](https://audio-studio-eosin.vercel.app)
 
-## 🏛️ System Architecture
+Android requires **Android 7.0 / API 24+** and **Android System WebView 99+**. Codec availability and hardware acceleration depend on the device; Settings reports the selected engine and available output formats. Keep WebView updated before using the app offline.
+
+## Features
+
+### Audio compressor
+
+- Genuine MP3, AAC in an M4A container, and 16-bit PCM WAV outputs.
+- Bitrates: 64, 96, 128, 160, 192, 224, 256, and 320 kbps. MP3 at 22,050 Hz supports up to 160 kbps; WAV bitrate follows its sample rate and channel count.
+- Sample rates: 22,050, 32,000, 44,100, and 48,000 Hz; mono or stereo.
+- Batch queue, progress, cancellation/retry, persistent exports, native sharing, and ZIP files containing actual audio bytes.
+- A/B playback and measured output sizes/bitrates, including outputs larger than the source.
+
+On Android, `NativeAudioEngine` uses MediaExtractor, MediaCodec, MediaMuxer, and streaming PCM resampling for M4A. MP3 and WAV use bundled worker encoders. Browser AAC is offered when WebCodecs supports it. Input decoding depends on the platform's support for MP3, M4A, AAC, WAV, FLAC, and OGG.
+
+### MetaTune and cover artwork
+
+- Read and write MP3 ID3 and standard M4A tags without re-encoding audio or changing its container.
+- Title, artist, album, album artist, genre, year/date, track number, composer, and plain lyrics.
+- Preserve existing artwork, replace it with a JPEG/PNG, or remove it.
+- Create a **1024 × 1024 PNG** locally using gradient, vinyl, or minimal styles.
+- Prepared exports remain available when library storage or the system save operation fails.
+
+### Analysis and trimming
+
+- K-weighted gated integrated loudness, RMS, sample peaks, crest factor, near-full-scale sample count, and measured silence intervals.
+- Hann-windowed FFT frequency-band energy and a peak envelope.
+- A 4× windowed-sinc intersample peak estimate; this is not a certified true-peak meter.
+- Trim a selected region and export it as WAV, MP3, or available AAC/M4A.
+
+### Library and preferences
+
+- IndexedDB stores imported audio, processed tracks, tags, artwork, favorites, and preferences.
+- Android native exports use persistent private storage and survive temporary-cache cleanup.
+- Search, sorting, favorites, playback, seeking, loop, volume, and speed control.
+- Dark/light themes, reduced motion, saved encoder/bitrate defaults, and engine diagnostics.
+- Android 10+ saves to `Downloads/AudioStudio`; Android 7–9 uses the system document picker. Sharing uses a narrowly scoped FileProvider.
+
+### Working limits
+
+- 100 MB per input; up to 100 queued tracks.
+- Browser/worker decoded PCM limit: 128 MB. Native M4A conversion streams PCM and can process tracks beyond that decoded-memory limit.
+- ZIP/in-memory device export limit: 200 MB; library import batches are also bounded to 200 MB.
+- Artwork: JPEG/PNG up to 8 MB. Unsupported, oversized, or corrupt inputs produce an error.
+
+## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph ClientLayer["Frontend & Device Processing Layer"]
-        A["Mobile Application (Android Native)"] -->|"Hardware Audio Transcoding"| B["NativeAudioEngine (Android MediaCodec / DSP)"]
-        C["Web Application (Vercel CDN)"] -->|"In-Browser Audio Transcoding"| D["Web Audio Engine (OfflineAudioContext + ID3Writer)"]
-        B --> E["Device Storage (Downloads/Music)"]
-        D --> F["Browser Local Storage & Downloads"]
-    end
-
-    subgraph StorageLayer["Local Device Persistence"]
-        G["IndexedDB (AudioStudioDB)"]
-        H["Tracks, Projects & User Settings"]
-        G --- H
-    end
-
-    subgraph CloudLayer["Lightweight Cloud Services (Render Backend)"]
-        I["Node.js / Express Coordinator"]
-        J["/health & /api/config"]
-        K["Optional Metadata Sync (/api/cloud/sync)"]
-        L["AI Artwork Generation Proxy"]
-        I --- J
-        I --- K
-        I --- L
-    end
-
-    ClientLayer -.->|"Optional Metadata Sync & AI Art"| CloudLayer
+    Android["Bundled Android UI"] --> Native["MediaCodec AAC + PCM resampling"]
+    Android --> Workers["Local MP3 / WAV / analysis workers"]
+    Web["Browser UI"] --> Workers
+    Web --> WebAudio["Web Audio + available WebCodecs AAC"]
+    Android --> Local["IndexedDB + persistent native exports"]
+    Web --> Local
+    Native --> Export["Device downloads / sharing"]
+    Workers --> Export
+    WebAudio --> Export
+    Web -.-> Optional["Optional authorized Express backend"]
+    Optional --> Index["Per-owner persistent metadata indexes"]
+    Optional --> Artwork["Online artwork provider"]
 ```
 
----
+The optional Express/FFmpeg and FastAPI/Mutagen services preserve legacy workflows. They are separate from the APK's local processing path.
 
-## 📱 Mobile Device Processing (Android)
+## Development
 
-The Android application operates completely **offline** with zero reliance on cloud computing:
+### Requirements
 
-- **Hardware Acceleration**: Built with a dedicated native Android bridge plugin (`NativeAudioEngine.java` + `AudioTranscoder.java`).
-- **MediaCodec & MediaMuxer**: Audio tracks (MP3, M4A, AAC, WAV, FLAC, OGG) are decoded via Android's native multimedia framework into PCM audio and re-encoded using hardware AAC/MPEG-4 encoders.
-- **Dynamic Bitrate Scaling**: User-selected target bitrates (320k, 256k, 192k, 160k, 128k, 96k, or custom).
-- **Metadata Retraction & Embedding**: Native `MediaMetadataRetriever` extracts tags and embedded album art.
-- **Scoped Storage Compliant**: Exports directly into public `Downloads/AudioStudio` and launches the native Android Share sheet.
+- Node.js **22.12+**; Node 24 is used in CI.
+- Android builds: **JDK 21**, Android SDK platform 36 and build-tools 36.0.0+, plus platform-tools.
+- Python 3.10+ for the optional MetaTune service/tests.
+- FFmpeg/ffprobe for optional server compression and native test-fixture generation.
 
----
-
-## 🌐 Web Processing (Vercel Web App)
-
-When running in modern desktop and mobile browsers:
-
-- **Web Audio API**: Decodes and resamples audio locally via `AudioContext` and `OfflineAudioContext`.
-- **Client-Side ID3v2 Tagging**: Uses `browser-id3-writer` to embed Title, Artist, Album, Year, Genre, Track Number, Lyrics, and Cover Artwork directly into MP3 files in client memory.
-- **Local ZIP Packaging**: Uses `JSZip` to bundle batch jobs into a compressed archive on the client without uploading bytes to any server.
-
----
-
-## 🚀 Key Modules & Capabilities
-
-### 1. Audio Compressor
-- **Bitrate Presets**:
-  - `320 kbps` (Studio Master — Near transparent)
-  - `256 kbps` (High Fidelity — Audiophile balance)
-  - `192 kbps` (Broadcast Standard — High quality)
-  - `160 kbps` (Balanced — Modern streaming)
-  - `128 kbps` (Small File — Rapid sharing)
-  - `96 kbps` (Podcast / Voice — Ultra compact)
-- **Controls**: Custom bitrate slider, sample-rate conversion (48kHz, 44.1kHz, 32kHz, 22.05kHz), channel conversion (Stereo / Mono), format selection.
-- **Batch Processing**: Multi-track queue, real hardware progress callbacks, cancel/retry, and local ZIP archive export.
-- **A/B Audio Comparison**: Real-time before-and-after A/B switcher allowing live auditioning between original and compressed audio.
-
-### 2. MetaTune (Tag & Artwork Editor)
-- **Tag Fields**: Title, Artist, Album, Album Artist, Genre, Year, Track Number, Composer, Copyright, Lyrics.
-- **Artwork Studio**: Add, preview, remove, or replace cover art.
-- **AI Cover Art Generator**: Generates 4K album artwork prompts with style and mood parameters via Pollinations AI.
-- **Direct Tag Writing**: Writes genuine ID3v2.3 tags directly into MP3s.
-
-### 3. Audio Tools & Analyzer
-- **Loudness & Levels**: Integrated LUFS estimation, True Peak dBFS, RMS level, Dynamic Range.
-- **Integrity Inspection**: Clipping sample counter and silence interval detection (< -50 dBFS).
-- **Multi-band Spectrum**: Sub-bass, Bass, Low-Mid, Mid, High-Mid, High frequency energy meters.
-- **Local Audio Trimmer**: Non-destructive start/end boundary selection with local export.
-
-### 4. Device Music Library
-- **Offline Indexing**: Local IndexedDB database storing imported and processed tracks.
-- **Management**: Search by title/artist/album, filter by favorites/processed, sort by date/size/title.
-- **Integrated Player**: Scrubber, timestamp readout, volume, speed control (0.75x to 2x), and loop.
-
----
-
-## 🛠️ Local Development & Build
-
-### Prerequisites
-- Node.js 20+
-- Java 21+ & Android SDK (for Android APK builds)
-- Python 3.10+ (for optional MetaTune service)
-
-### Install & Run Locally
 ```bash
-# Install dependencies
-npm install
-
-# Start Vite frontend and backend coordinator concurrently
+npm ci
 npm run dev
 ```
 
-### Run Tests
+### Checks
+
 ```bash
-# Run Vitest test suites (audioEngine, projectCompletion, server routes, utils)
 npm test
-
-# Run real audio file processing test (metatune/test.mp3 tagging & zip export)
+npm run typecheck
+npm run lint
 npm run verify:audio
-
-# Run Python MetaTune unit tests (12 tests)
-cmd /c "set PYTHONPATH=metatune&& .\.venv\Scripts\python.exe -m unittest discover -s metatune/tests"
+npm run verify:ffmpeg
+npm run build
+npm run test:e2e
 ```
 
----
+Install Chromium once with `npx playwright install chromium` before running `npm run test:e2e`. The browser suite builds the application and checks desktop and mobile routes, compression, metadata/artwork exports, trimming, and library persistence.
 
-## 📦 Deployment Guides
+Python tests on Windows PowerShell:
 
-### 1. Vercel (Frontend SPA)
-The frontend builds into `dist/client` and routes all pages through `vercel.json`:
-- **Build Command**: `npm run build:client`
-- **Output Directory**: `dist/client`
-- **SPA Rewrites**: Configured in `vercel.json` to handle all client routes (`/`, `/compressor`, `/metatune`, `/library`, `/tools`, `/settings`).
+```powershell
+$env:PYTHONPATH="metatune"
+& ".\.venv\Scripts\python.exe" -m unittest discover -s "metatune/tests"
+```
 
-### 2. Render (Lightweight Cloud Coordinator)
-The backend runs as a lightweight service defined in `render.yaml`:
-- **Build Command**: `npm ci --include=dev && (python3 -m venv .venv && .venv/bin/pip install -r metatune/requirements.txt || true) && npm run build`
-- **Start Command**: `npm start`
-- **Health Check**: `/health` (Responds in milliseconds with `{ ok: true, version: "2.0.0", mode: "device-first" }`)
-- **CORS**: Fully enabled for all origins including Vercel.
+On Linux/macOS, use `PYTHONPATH=metatune python -m unittest discover -s metatune/tests` after installing `metatune/requirements.txt`.
 
-### 3. Android APK Build
-Build the standalone offline APK:
+### Android release
+
+Configure `ANDROID_HOME` and `JAVA_HOME`, or use `android/local.properties` for the SDK path. For the first production build, initialize signing and securely retain the ignored `.signing/` directory:
+
 ```bash
+npm run android:signing
 npm run android:apk
+npm run android:test -- --serial DEVICE_SERIAL
 ```
-The compiled release APK is generated at:
-`android/app/build/outputs/apk/debug/app-debug.apk` and mirrored to `artifacts/Audio-Studio-Release.apk`.
+
+Outputs:
+
+- `artifacts/apk/Audio-Studio-Release.apk`
+- `artifacts/apk/Audio-Studio-Release.apk.sha256`
+- `artifacts/apk/Audio-Studio-Release.apk.build.json`
+- `artifacts/android-tests/validation.json` after successful release instrumentation.
+
+`android:apk` builds bundled Android-mode assets, checks native unit tests and release lint, aligns and signs the release, and verifies package/version, non-debuggable status, and offline permissions. `android:test` installs that release and a matching signed test APK, then exercises the packaged UI and native audio with real fixtures.
+
+[Android signing, verification, and publishing details](docs/ANDROID_RELEASE.md).
+
+## Deployment
+
+### Web / Vercel
+
+- Build: `npm run build:client`; output: `dist/client`.
+- `vercel.json` routes the supported SPA pages. Production builds generate a local offline shell for subsequent visits.
+- Optional backend URL: `VITE_BACKEND_URL` at build time, or the web Settings page.
+
+### Optional Express / Render
+
+- Build: `npm run build`; start: `npm start`; health: `/health`.
+- `ALLOWED_ORIGINS` must include the actual frontend origin; CORS uses an allowlist.
+- `API_TOKENS` maps owner IDs to distinct 32–256 character tokens. Web access tokens remain in memory for the session.
+- `SYNC_STORAGE_DIR` must point to persistent storage to enable per-owner metadata-index sync. The index contains track descriptions, not audio backups.
+- `POLLINATIONS_API_KEY` plus owner tokens enables optional online artwork generation.
+- `ENABLE_METATUNE=true` explicitly starts the legacy Python service.
+- FFmpeg uploads and jobs have request, queue, concurrency, and expiry limits. Remote processing requires backend authorization.
+
+`render.yaml` provides a starting blueprint; configure origins, credentials, and persistent storage for the intended deployment.
+
+## Verification
+
+CI runs TypeScript/Vitest checks, lint, real ID3/ZIP and FFmpeg verification, Python tests, Android unit tests/lint, and release instrumentation on an Android 15 emulator. CI uses a disposable signing key; published APKs use the maintained release signing identity.
+
+Release notes record the checks and Android versions actually tested. Emulator results establish those tested workflows; physical-device codec, audio-output, and OEM behavior require testing on the intended hardware.

@@ -1,17 +1,15 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import {
   UploadCloud,
   Music,
   Disc,
   X,
-  Play,
   RotateCcw,
   Sparkles,
   Download,
   Share2,
   FileArchive,
   AlertCircle,
-  CheckCircle2,
   Sliders,
   Radio
 } from "lucide-react";
@@ -19,10 +17,13 @@ import { toast } from "sonner";
 import {
   AudioEngine,
   CompressionOptions,
-  ProcessedAudioResult
+  ProcessedAudioResult,
+  MAX_INPUT_BYTES
 } from "../services/audioEngine";
-import { LibraryStorage } from "../services/libraryStorage";
+import { LibraryStorage, type UserSettings } from "../services/libraryStorage";
 import { ComparePlayer } from "../components/ComparePlayer";
+import { errorMessage, isCancelled } from "../services/errors";
+import { MP3_BITRATES, type AudioOutputFormat } from "../services/audioEncoding";
 
 interface BatchItem {
   id: string;
@@ -30,16 +31,17 @@ interface BatchItem {
   name: string;
   format: string;
   originalSize: number;
-  status: "queued" | "processing" | "completed" | "failed";
+  status: "queued" | "processing" | "completed" | "failed" | "cancelled";
   progress: number;
   stage: string;
   result?: ProcessedAudioResult;
   error?: string;
+  libraryWarning?: string;
 }
 
 const PRESETS = [
-  { id: "p320", label: "Studio Master", kbps: 320, desc: "320 kbps · Transparent", color: "#10b981" },
-  { id: "p256", label: "High Fidelity", kbps: 256, desc: "256 kbps · Audiophile", color: "#3b82f6" },
+  { id: "p320", label: "Highest Bitrate", kbps: 320, desc: "320 kbps · Larger files", color: "#10b981" },
+  { id: "p256", label: "High Fidelity", kbps: 256, desc: "256 kbps · High quality", color: "#3b82f6" },
   { id: "p192", label: "Broadcast", kbps: 192, desc: "192 kbps · Standard", color: "#8b5cf6" },
   { id: "p160", label: "Balanced", kbps: 160, desc: "160 kbps · Streaming", color: "#d946ef" },
   { id: "p128", label: "Small File", kbps: 128, desc: "128 kbps · Fast share", color: "#f59e0b" },
@@ -60,25 +62,55 @@ export const CompressorView: React.FC = () => {
   const [customKbps, setCustomKbps] = useState(192);
   const [sampleRate, setSampleRate] = useState(44100);
   const [channels, setChannels] = useState<1 | 2>(2);
-  const [outputFormat, setOutputFormat] = useState<"m4a" | "mp3" | "wav">("m4a");
+  const [outputFormat, setOutputFormat] = useState<AudioOutputFormat>("mp3");
+  const [outputFormats, setOutputFormats] = useState<AudioOutputFormat[]>(["mp3", "wav"]);
   const [isProcessingBatch, setIsProcessingBatch] = useState(false);
+  const [isExportingZip, setIsExportingZip] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const controllerRef = useRef<AbortController | null>(null);
+  const runningRef = useRef(false);
+  const defaultsRef = useRef<UserSettings | null>(null);
+  const outputRef = useRef({ sampleRate, outputFormat, customKbps });
+  outputRef.current = { sampleRate, outputFormat, customKbps };
+
+  useEffect(() => {
+    let disposed = false;
+    let supported: AudioOutputFormat[] = ["mp3", "wav"];
+    const apply = (settings: UserSettings) => {
+      if (runningRef.current) return;
+      const formatChanged = defaultsRef.current?.defaultFormat !== settings.defaultFormat;
+      const format = formatChanged ? supported.includes(settings.defaultFormat) ? settings.defaultFormat : "mp3" : outputRef.current.outputFormat;
+      let bitrate = defaultsRef.current?.defaultBitrate !== settings.defaultBitrate ? settings.defaultBitrate : outputRef.current.customKbps;
+      if (format === "mp3" && outputRef.current.sampleRate < 32000) bitrate = Math.min(160, bitrate);
+      if (bitrate !== outputRef.current.customKbps) { setCustomKbps(bitrate); setPresetId(`p${bitrate}`); }
+      if (formatChanged) setOutputFormat(format);
+      defaultsRef.current = settings;
+    };
+    void Promise.all([AudioEngine.getEngineInfo(), LibraryStorage.getSettings()]).then(([info, settings]) => {
+      if (!disposed) { supported = info.outputFormats; setOutputFormats(supported); apply(settings); }
+    }).catch((error: unknown) => toast.warning(errorMessage(error)));
+    const changed = (event: Event) => apply((event as CustomEvent<UserSettings>).detail);
+    const beforeUnload = (event: BeforeUnloadEvent) => { if (runningRef.current) { event.preventDefault(); event.returnValue = ""; } };
+    window.addEventListener("audio-studio:settings-changed", changed); window.addEventListener("beforeunload", beforeUnload);
+    return () => { disposed = true; controllerRef.current?.abort(); window.removeEventListener("audio-studio:settings-changed", changed); window.removeEventListener("beforeunload", beforeUnload); };
+  }, []);
 
   const addFiles = (fileList: FileList | File[]) => {
     const list = Array.from(fileList);
-    const valid = list.filter((f) => /\.(mp3|m4a|aac|wav|flac|ogg)$/i.test(f.name));
+    const valid = list.filter((f) => /\.(mp3|m4a|aac|wav|flac|ogg)$/i.test(f.name) && f.size > 0 && f.size <= MAX_INPUT_BYTES);
     const invalidCount = list.length - valid.length;
 
     if (invalidCount > 0) {
-      toast.warning(`${invalidCount} unsupported file(s) ignored.`);
+      toast.warning(`${invalidCount} empty, unsupported, or over-100 MB file(s) ignored.`);
     }
 
     if (!valid.length) return;
 
-    const newItems: BatchItem[] = valid.map((file) => ({
-      id: `${file.name}-${file.size}-${Date.now()}-${Math.random()}`,
+    const selected = valid.slice(0, Math.max(0, 100 - items.length));
+    if (selected.length < valid.length) toast.warning("The queue holds up to 100 tracks. Export and remove completed tracks to add more.");
+    const newItems: BatchItem[] = selected.map((file) => ({
+      id: crypto.randomUUID(),
       file,
       name: file.name,
       format: file.name.split(".").pop()?.toUpperCase() || "AUDIO",
@@ -101,17 +133,15 @@ export const CompressorView: React.FC = () => {
     setCustomKbps(p.kbps);
   };
 
-  const processSingleItem = async (item: BatchItem): Promise<void> => {
-    setItems((prev) =>
-      prev.map((i) => (i.id === item.id ? { ...i, status: "processing", progress: 5, stage: "Starting…" } : i))
-    );
+  const changeOutput = (format: AudioOutputFormat, rate: number) => {
+    setOutputFormat(format); setSampleRate(rate);
+    if (format === "mp3" && rate < 32000 && customKbps > 160) { setCustomKbps(160); setPresetId("p160"); }
+  };
 
-    const options: CompressionOptions = {
-      targetBitrateKbps: customKbps,
-      targetSampleRate: sampleRate,
-      targetChannels: channels,
-      outputFormat
-    };
+  const processSingleItem = async (item: BatchItem, options: CompressionOptions): Promise<{ status: "completed" | "failed" | "cancelled"; retainedBytes: number }> => {
+    setItems((prev) =>
+       prev.map((i) => (i.id === item.id ? { ...i, status: "processing", progress: 5, stage: "Starting…", error: undefined } : i))
+    );
 
     try {
       const result = await AudioEngine.compressAudio(item.file, options, (p) => {
@@ -130,12 +160,12 @@ export const CompressorView: React.FC = () => {
         )
       );
 
-      // Save to local library automatically
-      await LibraryStorage.saveTrack({
+      try { await LibraryStorage.saveTrack({
         id: item.id,
-        title: item.name.replace(/\.[^/.]+$/, ""),
-        artist: "Processed Audio",
-        album: "Audio Studio Exports",
+        title: result.metadata?.title || item.name.replace(/\.[^/.]+$/, ""),
+        artist: result.metadata?.artist || "Unknown Artist",
+        album: result.metadata?.album || "Audio Studio Exports",
+        coverArtBase64: result.metadata?.coverArtBase64,
         durationSec: result.durationSec,
         fileSize: result.outputSize,
         format: result.format,
@@ -147,34 +177,54 @@ export const CompressorView: React.FC = () => {
         isProcessed: true,
         originalSize: result.originalSize,
         savedPercent: result.savedPercent
-      });
-    } catch (err: any) {
+      }); } catch (error) {
+        const warning = errorMessage(error);
+        setItems((previous) => previous.map((i) => i.id === item.id ? { ...i, libraryWarning: warning } : i));
+        toast.warning(`Export ready, but library save failed: ${warning}`);
+      }
+      return { status: "completed", retainedBytes: result.blob?.size || 0 };
+    } catch (error) {
+      const cancelled = isCancelled(error) || options.signal?.aborted;
       setItems((prev) =>
         prev.map((i) =>
           i.id === item.id
-            ? { ...i, status: "failed", error: err.message || "Failed to compress", stage: "Failed" }
+            ? { ...i, status: cancelled ? "cancelled" : "failed", error: cancelled ? undefined : errorMessage(error), stage: cancelled ? "Cancelled" : "Failed" }
             : i
         )
       );
+      return { status: cancelled ? "cancelled" : "failed", retainedBytes: 0 };
     }
   };
 
-  const startBatchCompression = async () => {
-    if (!items.length) {
-      toast.error("Please add at least one audio file.");
+  const startBatchCompression = async (onlyId?: string) => {
+    if (runningRef.current) return;
+    const queued = items.filter((i) => (!onlyId || i.id === onlyId) && ["queued", "failed", "cancelled"].includes(i.status));
+    if (!queued.length) {
+      toast.info("Add new tracks or retry a failed track to process more audio.");
       return;
     }
-
+    runningRef.current = true;
+    const controller = new AbortController(); controllerRef.current = controller;
     setIsProcessingBatch(true);
-    toast.info("Beginning device-powered audio compression…");
-
-    const queued = items.filter((i) => i.status === "queued" || i.status === "failed");
-    for (const item of queued) {
-      await processSingleItem(item);
+    const options: CompressionOptions = { targetBitrateKbps: customKbps, targetSampleRate: sampleRate, targetChannels: channels, outputFormat, signal: controller.signal };
+    let completed = 0, failed = 0, paused = false;
+    let retainedBytes = items.reduce((sum, i) => sum + (i.result?.blob?.size || 0), 0);
+    try {
+      for (const item of queued) {
+        if (controller.signal.aborted) break;
+        if (retainedBytes >= 128 * 1024 * 1024) { paused = true; break; }
+        const result = await processSingleItem(item, options);
+        if (result.status === "completed") completed++;
+        if (result.status === "failed") failed++;
+        retainedBytes += result.retainedBytes;
+      }
+    } finally {
+      runningRef.current = false; controllerRef.current = null; setIsProcessingBatch(false);
     }
-
-    setIsProcessingBatch(false);
-    toast.success("Batch compression finished!");
+    if (paused) toast.info(`${completed} export(s) ready. Remove completed tracks from the queue before continuing to keep device memory bounded.`);
+    else if (controller.signal.aborted) toast.info(`Batch cancelled. ${completed} completed export(s) remain available.`);
+    else if (failed) toast.warning(`${completed} export(s) ready; ${failed} track(s) failed. Review the queue to retry.`);
+    else toast.success(`${completed} audio export(s) ready.`);
   };
 
   const downloadAllZip = async () => {
@@ -184,23 +234,26 @@ export const CompressorView: React.FC = () => {
       return;
     }
 
-    toast.info("Assembling ZIP archive on device…");
+    setIsExportingZip(true);
+    try {
     const zipFiles = completed.map((i) => ({
       name: i.result!.fileName,
       blob: i.result!.blob,
-      nativePath: i.result!.nativePath
+      nativePath: i.result!.nativePath,
+      outputSize: i.result!.outputSize
     }));
 
     const zipBlob = await AudioEngine.createZip(zipFiles);
-    const url = URL.createObjectURL(zipBlob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `AudioStudio_Batch_${Date.now()}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-    toast.success("ZIP archive downloaded!");
+    await AudioEngine.saveBlob(zipBlob, `AudioStudio_Batch_${Date.now()}.zip`);
+    toast.success(AudioEngine.isNative() ? "ZIP saved to Downloads." : "ZIP download started.");
+    } catch (error) { if (!isCancelled(error)) toast.error(errorMessage(error)); }
+    finally { setIsExportingZip(false); }
+  };
+
+  const exportItem = async (item: BatchItem, share = false) => {
+    if (!item.result) return;
+    try { if (share) await AudioEngine.shareAudio(item.result); else await AudioEngine.saveProcessedFile(item.result); }
+    catch (error) { if (!isCancelled(error)) toast.error(errorMessage(error)); }
   };
 
   const completedCount = items.filter((i) => i.status === "completed").length;
@@ -222,13 +275,14 @@ export const CompressorView: React.FC = () => {
             setIsDragging(false);
             if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
           }}
-          onClick={() => fileInputRef.current?.click()}
         >
           <input
             type="file"
             multiple
             accept=".mp3,.m4a,.aac,.wav,.flac,.ogg,audio/*"
             ref={fileInputRef}
+            hidden
+            aria-label="Audio files for compression"
             onChange={(e) => {
               if (e.target.files?.length) addFiles(e.target.files);
               e.target.value = "";
@@ -238,7 +292,7 @@ export const CompressorView: React.FC = () => {
             <Radio size={36} className="pulse-icon text-accent" />
           </div>
           <h2>Drop Audio Files Here</h2>
-          <p>Supports MP3, M4A, AAC, WAV, FLAC · Up to 100 tracks per batch</p>
+          <p>MP3, M4A, AAC, WAV, FLAC, OGG · 100 MB per file · Up to 100 tracks</p>
           <button
             type="button"
             className="btn-primary"
@@ -277,6 +331,7 @@ export const CompressorView: React.FC = () => {
                   multiple
                   accept=".mp3,.m4a,.aac,.wav,.flac,.ogg,audio/*"
                   ref={fileInputRef}
+                  aria-label="More audio files for compression"
                   style={{ display: "none" }}
                   onChange={(e) => {
                     if (e.target.files?.length) addFiles(e.target.files);
@@ -303,14 +358,14 @@ export const CompressorView: React.FC = () => {
                       {item.result && (
                         <>
                           <span>·</span>
-                          <span className="text-success">
-                            {formatBytes(item.result.outputSize)} (-{item.result.savedPercent}%)
+                          <span className={item.result.savedPercent >= 0 ? "text-success" : "text-warning"}>
+                            {formatBytes(item.result.outputSize)} ({Math.abs(item.result.savedPercent)}% {item.result.savedPercent >= 0 ? "smaller" : "larger"})
                           </span>
                         </>
                       )}
                     </div>
                     {item.status === "processing" && (
-                      <div className="mini-progress">
+                      <div className="mini-progress" role="progressbar" aria-label={`Encoding ${item.name}`} aria-valuenow={item.progress} aria-valuemin={0} aria-valuemax={100}>
                         <div
                           className="mini-progress-fill"
                           style={{ width: `${item.progress}%` }}
@@ -323,6 +378,8 @@ export const CompressorView: React.FC = () => {
                         <AlertCircle size={12} /> {item.error}
                       </div>
                     )}
+                    {item.status === "cancelled" && <p className="text-muted">Cancelled · Ready to retry</p>}
+                    {item.libraryWarning && <p className="text-warning">Export available; library save failed: {item.libraryWarning}</p>}
                   </div>
 
                   <div className="card-actions">
@@ -331,7 +388,8 @@ export const CompressorView: React.FC = () => {
                         <button
                           type="button"
                           className="btn-icon"
-                          onClick={() => AudioEngine.saveProcessedFile(item.result!)}
+                          onClick={() => exportItem(item)}
+                          aria-label={`Save ${item.result.fileName}`}
                           title="Save to device"
                         >
                           <Download size={16} />
@@ -339,18 +397,21 @@ export const CompressorView: React.FC = () => {
                         <button
                           type="button"
                           className="btn-icon"
-                          onClick={() => AudioEngine.shareAudio(item.result!)}
+                          onClick={() => exportItem(item, true)}
+                          aria-label={`Share ${item.result.fileName}`}
                           title="Share audio"
                         >
                           <Share2 size={16} />
                         </button>
                       </>
                     )}
-                    {item.status === "failed" && (
+                    {(item.status === "failed" || item.status === "cancelled") && (
                       <button
                         type="button"
                         className="btn-icon text-warning"
-                        onClick={() => processSingleItem(item)}
+                        onClick={() => startBatchCompression(item.id)}
+                        disabled={isProcessingBatch || isExportingZip}
+                        aria-label={`Retry ${item.name}`}
                         title="Retry"
                       >
                         <RotateCcw size={16} />
@@ -360,7 +421,8 @@ export const CompressorView: React.FC = () => {
                       type="button"
                       className="btn-icon text-muted"
                       onClick={() => removeItem(item.id)}
-                      disabled={item.status === "processing"}
+                      disabled={isProcessingBatch || isExportingZip}
+                      aria-label={`Remove ${item.name} from queue`}
                       title="Remove"
                     >
                       <X size={16} />
@@ -373,6 +435,8 @@ export const CompressorView: React.FC = () => {
 
           {/* Right: Engine Settings */}
           <div className="settings-column glass-panel">
+            <fieldset className="engine-controls" disabled={isProcessingBatch || isExportingZip}>
+            <legend className="sr-only">Audio output settings</legend>
             <div className="column-header">
               <div className="title-row">
                 <Sliders size={18} className="text-accent" />
@@ -381,13 +445,15 @@ export const CompressorView: React.FC = () => {
             </div>
 
             <div className="presets-section">
-              <label className="section-label">Bitrate Presets</label>
+              <h4 className="section-label">Bitrate Presets</h4>
               <div className="presets-grid">
                 {PRESETS.map((p) => (
                   <button
                     key={p.id}
                     type="button"
                     className={`preset-card ${presetId === p.id ? "active" : ""}`}
+                    aria-pressed={presetId === p.id}
+                    disabled={outputFormat === "wav" || (outputFormat === "mp3" && sampleRate < 32000 && p.kbps > 160)}
                     onClick={() => selectPreset(p)}
                   >
                     <div className="preset-name">{p.label}</div>
@@ -402,19 +468,18 @@ export const CompressorView: React.FC = () => {
                 <label htmlFor="custom-kbps">Target Bitrate</label>
                 <span className="slider-value">{customKbps} kbps</span>
               </div>
-              <input
+              <select
                 id="custom-kbps"
-                type="range"
-                min="64"
-                max="320"
-                step="32"
                 value={customKbps}
+                disabled={outputFormat === "wav"}
                 onChange={(e) => {
                   setCustomKbps(Number(e.target.value));
                   setPresetId("custom");
                 }}
-                className="range-slider"
-              />
+                className="select-input"
+              >{MP3_BITRATES.map((bitrate) => <option key={bitrate} value={bitrate} disabled={outputFormat === "mp3" && sampleRate < 32000 && bitrate > 160}>{bitrate} kbps</option>)}</select>
+              {outputFormat === "mp3" && sampleRate < 32000 && <p className="text-muted">At 22,050 Hz, MP3 supports up to 160 kbps.</p>}
+              {outputFormat === "wav" && <p className="text-muted">WAV uses 16-bit PCM: {sampleRate * channels * 16 / 1000} kbps. It may be larger than the source.</p>}
             </div>
 
             <div className="options-row">
@@ -423,7 +488,7 @@ export const CompressorView: React.FC = () => {
                 <select
                   id="sample-rate"
                   value={sampleRate}
-                  onChange={(e) => setSampleRate(Number(e.target.value))}
+                  onChange={(e) => changeOutput(outputFormat, Number(e.target.value))}
                   className="select-input"
                 >
                   <option value={48000}>48,000 Hz (Broadcast)</option>
@@ -453,39 +518,42 @@ export const CompressorView: React.FC = () => {
                 <select
                   id="output-format"
                   value={outputFormat}
-                  onChange={(e) => setOutputFormat(e.target.value as any)}
+                  onChange={(e) => changeOutput(e.target.value as AudioOutputFormat, sampleRate)}
                   className="select-input"
                 >
-                  <option value="m4a">M4A (Hardware AAC)</option>
+                  <option value="m4a" disabled={!outputFormats.includes("m4a")}>M4A / AAC{!outputFormats.includes("m4a") ? " (encoder unavailable)" : ""}</option>
                   <option value="mp3">MP3</option>
-                  <option value="wav">WAV (Lossless)</option>
+                  <option value="wav">WAV (16-bit PCM)</option>
                 </select>
               </div>
             </div>
+            </fieldset>
 
             <div className="action-button-group">
               <button
                 type="button"
                 className="btn-primary w-full"
-                onClick={startBatchCompression}
-                disabled={isProcessingBatch}
+                onClick={() => startBatchCompression()}
+                disabled={isProcessingBatch || isExportingZip || !items.some((i) => ["queued", "failed", "cancelled"].includes(i.status))}
               >
                 <Sparkles size={18} />
                 <span>
                   {isProcessingBatch
                     ? "Processing on Device…"
-                    : `Compress ${items.length} Track${items.length === 1 ? "" : "s"}`}
+                    : `${outputFormat === "wav" ? "Convert" : "Compress"} Audio`}
                 </span>
               </button>
+              {isProcessingBatch && <button type="button" className="btn-secondary w-full" onClick={() => controllerRef.current?.abort()}>Cancel Batch</button>}
 
               {completedCount > 0 && (
                 <button
                   type="button"
                   className="btn-secondary w-full"
                   onClick={downloadAllZip}
+                  disabled={isProcessingBatch || isExportingZip}
                 >
                   <FileArchive size={18} />
-                  <span>Export All as ZIP ({completedCount})</span>
+                  <span>{isExportingZip ? "Creating ZIP…" : `Export All as ZIP (${completedCount})`}</span>
                 </button>
               )}
             </div>
@@ -499,9 +567,10 @@ export const CompressorView: React.FC = () => {
           <ComparePlayer
             originalFile={firstCompleted.file}
             compressedBlob={firstCompleted.result.blob}
+            compressedSrc={firstCompleted.result.nativePath ? AudioEngine.nativeFileUrl(firstCompleted.result.nativePath) : undefined}
             originalSize={firstCompleted.originalSize}
             compressedSize={firstCompleted.result.outputSize}
-            originalBitrate={320}
+            originalBitrate={firstCompleted.result.metadata?.bitrate}
             compressedBitrate={firstCompleted.result.bitrateKbps}
             title={firstCompleted.name}
           />

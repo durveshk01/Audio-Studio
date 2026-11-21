@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-path name="my_images" path="." />
-    <cache-path name="my_cache_images" path="." />
-    <files-path name="my_files" path="." />
-    <external-files-path name="my_ext_files" path="." />
+    <cache-path name="temporary_exports" path="audio-studio-temp/" />
+    <cache-path name="legacy_exports" path="processed_audio/" />
+    <files-path name="audio_exports" path="audio-exports/" />
 </paths>

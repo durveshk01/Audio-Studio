@@ -1,5 +1,5 @@
 import React from "react";
-import { Home, Music2, Sparkles, Library, Sliders } from "lucide-react";
+import { Home, Music2, Sparkles, Library, Sliders, Settings } from "lucide-react";
 import { NavTab } from "./Sidebar";
 
 interface MobileNavProps {
@@ -16,11 +16,12 @@ export const MobileNav: React.FC<MobileNavProps> = ({
     { id: "compressor" as NavTab, label: "Compress", icon: Music2 },
     { id: "metatune" as NavTab, label: "MetaTune", icon: Sparkles },
     { id: "library" as NavTab, label: "Library", icon: Library },
-    { id: "tools" as NavTab, label: "Tools", icon: Sliders }
+    { id: "tools" as NavTab, label: "Tools", icon: Sliders },
+    { id: "settings" as NavTab, label: "Settings", icon: Settings }
   ];
 
   return (
-    <nav className="mobile-bottom-nav">
+    <nav className="mobile-bottom-nav" aria-label="Mobile navigation">
       {items.map((item) => {
         const Icon = item.icon;
         const isActive = activeTab === item.id;
@@ -30,6 +31,7 @@ export const MobileNav: React.FC<MobileNavProps> = ({
             type="button"
             className={`mobile-nav-item ${isActive ? "active" : ""}`}
             onClick={() => onSelectTab(item.id)}
+            aria-current={isActive ? "page" : undefined}
           >
             <Icon size={20} />
             <span>{item.label}</span>

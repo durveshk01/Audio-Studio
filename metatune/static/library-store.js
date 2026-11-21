@@ -26,12 +26,13 @@
         };
         request.onsuccess = () => {
           const db = request.result;
-          db.onversionchange = () => db.close();
+          db.onversionchange = () => { db.close(); databasePromise = null; };
+          db.onclose = () => { databasePromise = null; };
           resolve(db);
         };
         request.onerror = () => reject(request.error || new Error("Could not open local music library."));
         request.onblocked = () => reject(new Error("Close other MetaTune tabs and reload this page to update local storage."));
-      });
+      }).catch((error) => { databasePromise = null; throw error; });
     }
     return databasePromise;
   }

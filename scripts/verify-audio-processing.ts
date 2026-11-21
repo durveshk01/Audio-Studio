@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { ID3Writer } from "browser-id3-writer";
+import { AudioEngine } from "../src/client/services/audioEngine";
 import JSZip from "jszip";
 
 async function verifyAudioEngine() {
@@ -16,15 +16,14 @@ async function verifyAudioEngine() {
 
   // 1. Test ID3 Tag Writing
   console.log("\n1. Testing ID3v2 Tag Writing on test.mp3...");
-  const writer = new ID3Writer(sampleBytes.buffer);
-  writer.setFrame("TIT2", "Audio Studio Device Test Track");
-  writer.setFrame("TPE1", ["Audio Studio Engine"]);
-  writer.setFrame("TALB", "Device Processing Demo");
-  writer.setFrame("TYER", 2026);
-  writer.setFrame("TCON", ["Studio Electronic"]);
-  writer.addTag();
-
-  const taggedBlob = writer.getBlob();
+  const taggedBlob = await AudioEngine.writeMp3Metadata(new Blob([sampleBytes], { type: "audio/mpeg" }), {
+    title: "Audio Studio Device Test Track", artist: "Audio Studio Engine", album: "Device Processing Demo",
+    year: "2026", genre: "Studio Electronic"
+  });
+  const metadata = await AudioEngine.readMetadata(taggedBlob);
+  if (metadata.title !== "Audio Studio Device Test Track" || metadata.artist !== "Audio Studio Engine" || metadata.year !== "2026") {
+    throw new Error("Tagged MP3 metadata did not round trip through the application engine.");
+  }
   const taggedArrayBuf = await taggedBlob.arrayBuffer();
   const taggedBuffer = Buffer.from(taggedArrayBuf);
   console.log(`✓ Tagged audio buffer generated: ${taggedBuffer.length} bytes`);
@@ -61,7 +60,7 @@ async function verifyAudioEngine() {
   // 3. Verify ZIP integrity
   const loadedZip = await JSZip.loadAsync(zipBuffer);
   const unzippedMp3 = await loadedZip.file("Audio-Studio-Master.mp3")?.async("nodebuffer");
-  if (!unzippedMp3 || unzippedMp3.length !== taggedBuffer.length) {
+  if (!unzippedMp3 || !unzippedMp3.equals(taggedBuffer)) {
     throw new Error("Unzipped file does not match original bytes!");
   }
   console.log(`✓ Verified ZIP integrity (unzipped ${unzippedMp3.length} bytes perfectly matches original)`);

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { compressAudio } from "../src/server/ffmpeg.js";
+import { config } from "../src/server/config.js";
 
 function run(command: string, args: string[]) {
   return new Promise<void>((resolve, reject) => {
@@ -24,7 +25,7 @@ const input = path.join(tempDir, "sample.mp3");
 const output = path.join(tempDir, "sample-compressed.mp3");
 
 try {
-  await run("ffmpeg", [
+  await run(config.ffmpegPath, [
     "-y",
     "-f",
     "lavfi",

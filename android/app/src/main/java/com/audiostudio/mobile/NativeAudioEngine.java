@@ -1,344 +1,308 @@
 package com.audiostudio.mobile;
 
+import android.app.Activity;
+import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
+import android.media.MediaFormat;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
 import android.util.Base64;
-import android.util.Log;
 
+import androidx.activity.result.ActivityResult;
 import androidx.core.content.FileProvider;
-
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 @CapacitorPlugin(name = "NativeAudioEngine")
-public class NativeAudioEngine extends Plugin {
-    private static final String TAG = "NativeAudioEngine";
-    private AudioTranscoder currentTranscoder = null;
+public final class NativeAudioEngine extends Plugin {
+    private final AtomicReference<AudioTranscoder> current = new AtomicReference<>();
+    private final Map<String, File> imports = new ConcurrentHashMap<>();
+    private final ExecutorService encoderExecutor = Executors.newSingleThreadExecutor();
+    private final ExecutorService ioExecutor = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(8));
+
+    private interface IoWork { void run() throws Exception; }
+    private void io(PluginCall call, IoWork work) {
+        try { ioExecutor.execute(() -> { try { work.run(); } catch (Exception e) { call.reject(e.getMessage() == null ? "Device file operation failed." : e.getMessage()); } }); }
+        catch (RuntimeException e) { call.reject("Device storage is busy. Try again shortly."); }
+    }
+
+    private File temporaryDir() { return new File(getContext().getCacheDir(), "audio-studio-temp"); }
+    private File exportsDir() { return new File(getContext().getFilesDir(), "audio-exports"); }
+    private static String safeName(String value) {
+        String name = (value == null ? "AudioTrack" : value).replaceAll("[\\x00-\\x1f/\\\\:*?\"<>|]", "_").replaceAll("[. ]+$", "").trim();
+        if (name.isEmpty()) name = "AudioTrack";
+        int dot = name.lastIndexOf('.');
+        String extension = dot >= 0 && name.substring(dot).matches("(?i)\\.[a-z0-9]{1,10}") ? name.substring(dot) : "";
+        String base = extension.isEmpty() ? name : name.substring(0, dot);
+        if (base.isEmpty()) base = "AudioTrack";
+        int limit = 180 - extension.getBytes(StandardCharsets.UTF_8).length;
+        int end = 0, bytes = 0;
+        while (end < base.length()) {
+            int next = end + Character.charCount(base.codePointAt(end));
+            int size = base.substring(end, next).getBytes(StandardCharsets.UTF_8).length;
+            if (bytes + size > limit) break;
+            bytes += size; end = next;
+        }
+        return base.substring(0, end) + extension;
+    }
+
+    private File ownedPath(String value, boolean mustExist) throws IOException {
+        if (value == null || value.isEmpty()) throw new IOException("Missing device file.");
+        File file = new File(value).getCanonicalFile();
+        String name = file.getPath();
+        boolean allowed = name.startsWith(temporaryDir().getCanonicalPath() + File.separator)
+                || name.startsWith(exportsDir().getCanonicalPath() + File.separator)
+                || name.startsWith(new File(getContext().getCacheDir(), "processed_audio").getCanonicalPath() + File.separator);
+        if (!allowed || (mustExist && !file.isFile())) throw new IOException("The selected app-owned audio file is unavailable.");
+        return file;
+    }
+
+    @PluginMethod
+    public void importFileChunk(PluginCall call) {
+        io(call, () -> {
+            String session = call.getString("sessionId");
+            String encoded = call.getString("base64", "");
+            if (encoded.length() > 1400000) throw new IOException("Import chunks must be at most 1 MB.");
+            File file;
+            if (session == null) {
+                if (imports.size() >= 2) throw new IOException("Another file import is running.");
+                if (!temporaryDir().isDirectory() && !temporaryDir().mkdirs()) throw new IOException("Could not create temporary storage.");
+                session = UUID.randomUUID().toString();
+                file = new File(temporaryDir(), session + "-" + safeName(call.getString("fileName")));
+                imports.put(session, file);
+            } else {
+                file = imports.get(session);
+                if (file == null) throw new IOException("The file import session expired.");
+            }
+            try {
+                byte[] bytes = Base64.decode(encoded, Base64.NO_WRAP);
+                if (bytes.length == 0 || bytes.length > 1024 * 1024 || file.length() + bytes.length > 200L * 1024 * 1024) throw new IOException("Device file export exceeds the supported size.");
+                try (OutputStream output = new FileOutputStream(file, true)) { output.write(bytes); }
+                if (Boolean.TRUE.equals(call.getBoolean("complete", false))) imports.remove(session);
+                JSObject result = new JSObject(); result.put("sessionId", session); result.put("path", file.getAbsolutePath());
+                call.resolve(result);
+            } catch (Exception error) { imports.remove(session); file.delete(); throw error; }
+        });
+    }
+
+    @PluginMethod
+    public void removeTemporaryFile(PluginCall call) {
+        io(call, () -> {
+            File file = ownedPath(call.getString("path"), false);
+            if (!file.getCanonicalPath().startsWith(temporaryDir().getCanonicalPath() + File.separator)) throw new IOException("Only temporary imports can be removed by this operation.");
+            imports.values().remove(file);
+            if (file.exists() && !file.delete()) throw new IOException("Could not remove the temporary file.");
+            call.resolve();
+        });
+    }
+
+    @PluginMethod
+    public void deleteNativeExport(PluginCall call) {
+        io(call, () -> {
+            File file = ownedPath(call.getString("path"), false);
+            if (!file.getCanonicalPath().startsWith(exportsDir().getCanonicalPath() + File.separator)) throw new IOException("Only app-created exports can be removed.");
+            if (file.exists() && !file.delete()) throw new IOException("Could not remove the audio export.");
+            call.resolve();
+        });
+    }
 
     @PluginMethod
     public void getEngineInfo(PluginCall call) {
-        try {
-            JSObject info = new JSObject();
-            info.put("platform", "android");
-            info.put("abi", Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown");
-            info.put("androidVersion", Build.VERSION.RELEASE);
-            info.put("sdkInt", Build.VERSION.SDK_INT);
-            info.put("deviceModel", Build.MANUFACTURER + " " + Build.MODEL);
-            info.put("availableCores", Runtime.getRuntime().availableProcessors());
-            info.put("maxMemoryMb", (int) (Runtime.getRuntime().maxMemory() / (1024 * 1024)));
-            info.put("totalMemoryMb", (int) (Runtime.getRuntime().totalMemory() / (1024 * 1024)));
-            info.put("freeMemoryMb", (int) (Runtime.getRuntime().freeMemory() / (1024 * 1024)));
-            info.put("engineVersion", "2.0.0-hardware-accel");
-
-            JSArray codecs = new JSArray();
+        io(call, () -> {
+            MediaFormat format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 44100, 2);
+            format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+            format.setInteger(MediaFormat.KEY_BIT_RATE, 192000);
             MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
-            for (MediaCodecInfo codecInfo : list.getCodecInfos()) {
-                if (codecInfo.isEncoder()) {
-                    for (String type : codecInfo.getSupportedTypes()) {
-                        if (type.startsWith("audio/")) {
-                            codecs.put(codecInfo.getName() + " (" + type + ")");
-                        }
-                    }
-                }
+            String name = list.findEncoderForFormat(format);
+            boolean hardware = false;
+            JSArray codecs = new JSArray();
+            for (MediaCodecInfo info : list.getCodecInfos()) if (info.isEncoder()) {
+                for (String type : info.getSupportedTypes()) if (type.startsWith("audio/")) codecs.put(info.getName() + " (" + type + ")");
+                if (info.getName().equals(name) && Build.VERSION.SDK_INT >= 29) hardware = info.isHardwareAccelerated();
             }
-            info.put("audioEncoders", codecs);
-            info.put("isNativeDevicePowered", true);
+            JSObject info = new JSObject();
+            info.put("platform", "android"); info.put("abi", Build.SUPPORTED_ABIS.length > 0 ? Build.SUPPORTED_ABIS[0] : "unknown");
+            info.put("availableCores", Runtime.getRuntime().availableProcessors());
+            info.put("freeMemoryMb", Runtime.getRuntime().freeMemory() / (1024 * 1024));
+            info.put("aacAvailable", name != null); info.put("aacEncoder", name); info.put("hardwareAcceleration", hardware);
+            info.put("audioEncoders", codecs); info.put("isNativeDevicePowered", true);
             call.resolve(info);
-        } catch (Exception e) {
-            Log.e(TAG, "Error getting engine info", e);
-            call.reject("Could not get native engine info: " + e.getMessage());
-        }
+        });
     }
 
     @PluginMethod
     public void extractMetadata(PluginCall call) {
-        String inputPath = call.getString("path");
-        String uriStr = call.getString("uri");
-
-        if ((inputPath == null || inputPath.isEmpty()) && (uriStr == null || uriStr.isEmpty())) {
-            call.reject("Missing file path or URI");
-            return;
-        }
-
-        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
-        try {
-            if (uriStr != null && !uriStr.isEmpty()) {
-                retriever.setDataSource(getContext(), Uri.parse(uriStr));
-            } else {
-                retriever.setDataSource(inputPath);
-            }
-
-            JSObject meta = new JSObject();
-            meta.put("title", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE));
-            meta.put("artist", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST));
-            meta.put("album", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM));
-            meta.put("albumArtist", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST));
-            meta.put("genre", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_GENRE));
-            meta.put("year", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_YEAR));
-            meta.put("date", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DATE));
-            meta.put("trackNumber", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER));
-            meta.put("composer", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_COMPOSER));
-            meta.put("bitrate", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE));
-
-            String durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
-            long durationMs = durStr != null ? Long.parseLong(durStr) : 0;
-            meta.put("durationMs", durationMs);
-            meta.put("durationSec", durationMs / 1000.0);
-
-            byte[] pic = retriever.getEmbeddedPicture();
-            if (pic != null && pic.length > 0) {
-                meta.put("hasCoverArt", true);
-                meta.put("coverArtBase64", "data:image/jpeg;base64," + Base64.encodeToString(pic, Base64.NO_WRAP));
-                meta.put("coverArtSizeBytes", pic.length);
-            } else {
-                meta.put("hasCoverArt", false);
-            }
-
-            call.resolve(meta);
-        } catch (Exception e) {
-            Log.e(TAG, "Error extracting metadata", e);
-            call.reject("Metadata extraction failed: " + e.getMessage());
-        } finally {
-            try { retriever.release(); } catch (Exception ignored) {}
-        }
+        io(call, () -> {
+            File file = ownedPath(call.getString("path"), true);
+            MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+            try {
+                retriever.setDataSource(file.getAbsolutePath());
+                JSObject result = new JSObject();
+                result.put("title", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE));
+                result.put("artist", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST));
+                result.put("album", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM));
+                result.put("albumArtist", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST));
+                result.put("genre", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_GENRE));
+                result.put("year", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_YEAR));
+                result.put("trackNumber", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CD_TRACK_NUMBER));
+                result.put("composer", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_COMPOSER));
+                result.put("bitrate", retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE));
+                String duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+                result.put("durationSec", duration == null ? 0 : Long.parseLong(duration) / 1000.0);
+                byte[] picture = retriever.getEmbeddedPicture();
+                result.put("hasCoverArt", picture != null);
+                if (picture != null && picture.length > 0 && picture.length <= 8 * 1024 * 1024) result.put("coverArtBase64", "data:image/" + (picture[0] == (byte) 137 ? "png" : "jpeg") + ";base64," + Base64.encodeToString(picture, Base64.NO_WRAP));
+                call.resolve(result);
+            } finally { retriever.release(); }
+        });
     }
 
     @PluginMethod
     public void processAudio(PluginCall call) {
-        String inputPath = call.getString("path");
-        String uriStr = call.getString("uri");
-        int targetBitrateKbps = call.getInt("targetBitrateKbps", 128);
-        int targetSampleRate = call.getInt("targetSampleRate", 44100);
-        int targetChannels = call.getInt("targetChannels", 2);
-        double trimStart = call.getDouble("trimStartSeconds", 0.0);
-        double trimEnd = call.getDouble("trimEndSeconds", 0.0);
-        String customOutputName = call.getString("outputName");
-
-        if ((inputPath == null || inputPath.isEmpty()) && (uriStr == null || uriStr.isEmpty())) {
-            call.reject("Missing audio input source");
-            return;
-        }
-
-        Uri sourceUri;
-        long inputSize = 0;
+        AudioTranscoder transcoder = new AudioTranscoder();
+        if (!current.compareAndSet(null, transcoder)) { call.reject("Another device audio operation is running."); return; }
         try {
-            if (uriStr != null && !uriStr.isEmpty()) {
-                sourceUri = Uri.parse(uriStr);
-            } else {
-                File inputFile = new File(inputPath);
-                inputSize = inputFile.length();
-                sourceUri = Uri.fromFile(inputFile);
-            }
-        } catch (Exception e) {
-            call.reject("Invalid input file: " + e.getMessage());
-            return;
-        }
-
-        File outputDir = new File(getContext().getCacheDir(), "processed_audio");
-        outputDir.mkdirs();
-
-        String genName = customOutputName != null && !customOutputName.isEmpty()
-                ? customOutputName
-                : "audiostudio_" + UUID.randomUUID().toString().substring(0, 8) + ".m4a";
-        if (!genName.endsWith(".m4a")) genName += ".m4a";
-        final String finalFileName = genName;
-        final long finalInputSize = inputSize;
-        final Uri finalSourceUri = sourceUri;
-
-        File outputFile = new File(outputDir, finalFileName);
-
-        currentTranscoder = new AudioTranscoder();
-
-        new Thread(() -> {
-            try {
-                AudioTranscoder.TranscodeResult result = currentTranscoder.transcode(
-                        getContext(),
-                        finalSourceUri,
-                        outputFile,
-                        targetBitrateKbps,
-                        targetSampleRate,
-                        targetChannels,
-                        trimStart,
-                        trimEnd,
-                        (percent, stage, bytesProcessed) -> {
-                            JSObject progressEvent = new JSObject();
-                            progressEvent.put("percent", percent);
-                            progressEvent.put("stage", stage);
-                            progressEvent.put("bytesProcessed", bytesProcessed);
-                            notifyListeners("transcodeProgress", progressEvent);
-                        }
-                );
-
-                long originalBytes = finalInputSize > 0 ? finalInputSize : result.outputSize * 2;
-                long outBytes = result.outputSize;
-                double savedPercent = originalBytes > 0
-                        ? Math.max(0, Math.round(((double) (originalBytes - outBytes) / originalBytes) * 100))
-                        : 0;
-
-                JSObject res = new JSObject();
-                res.put("success", true);
-                res.put("outputPath", result.outputFile.getAbsolutePath());
-                res.put("fileName", finalFileName);
-                res.put("outputSize", outBytes);
-                res.put("originalSize", originalBytes);
-                res.put("durationSec", result.durationUs / 1_000_000.0);
-                res.put("outputBitrateKbps", result.outputBitrateKbps);
-                res.put("outputSampleRate", result.outputSampleRate);
-                res.put("outputChannels", result.outputChannels);
-                res.put("savedPercent", savedPercent);
-                res.put("contentUri", FileProvider.getUriForFile(
-                        getContext(),
-                        getContext().getPackageName() + ".fileprovider",
-                        result.outputFile
-                ).toString());
-
-                call.resolve(res);
-            } catch (Exception e) {
-                Log.e(TAG, "Native transcode failed", e);
-                call.reject("Device transcode failed: " + e.getMessage());
-            } finally {
-                currentTranscoder = null;
-            }
-        }).start();
+            File source = ownedPath(call.getString("path"), true);
+            String display = safeName(call.getString("outputName", "AudioTrack.m4a"));
+            if (!display.toLowerCase(Locale.ROOT).endsWith(".m4a")) display += ".m4a";
+            final String fileName = display;
+            File output = new File(exportsDir(), UUID.randomUUID() + "-" + fileName);
+            encoderExecutor.execute(() -> {
+                try {
+                    AudioTranscoder.TranscodeResult result = transcoder.transcode(getContext(), Uri.fromFile(source), output,
+                            call.getInt("targetBitrateKbps", 192), call.getInt("targetSampleRate", 44100), call.getInt("targetChannels", 2),
+                            call.getDouble("trimStartSeconds", 0.0), call.getDouble("trimEndSeconds", 0.0),
+                            (percent, stage, bytes) -> { JSObject event = new JSObject(); event.put("percent", percent); event.put("stage", stage); event.put("bytesProcessed", bytes); notifyListeners("transcodeProgress", event); });
+                    JSObject response = new JSObject();
+                    response.put("outputPath", output.getAbsolutePath()); response.put("fileName", fileName);
+                    response.put("outputSize", result.outputSize); response.put("originalSize", source.length());
+                    response.put("durationSec", result.durationUs / 1000000.0); response.put("outputBitrateKbps", result.outputBitrateKbps);
+                    response.put("outputSampleRate", result.outputSampleRate); response.put("outputChannels", result.outputChannels);
+                    response.put("contentUri", FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", output).toString());
+                    current.compareAndSet(transcoder, null);
+                    call.resolve(response);
+                } catch (Exception error) { call.reject("Device conversion failed: " + error.getMessage()); }
+                finally { current.compareAndSet(transcoder, null); }
+            });
+        } catch (Exception error) { current.compareAndSet(transcoder, null); call.reject(error.getMessage()); }
     }
 
     @PluginMethod
-    public void cancelProcessing(PluginCall call) {
-        if (currentTranscoder != null) {
-            currentTranscoder.cancel();
-            call.resolve();
-        } else {
-            call.resolve();
+    public void cancelProcessing(PluginCall call) { AudioTranscoder task = current.get(); if (task != null) task.cancel(); call.resolve(); }
+
+    private static String mime(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".mp3")) return "audio/mpeg";
+        if (lower.endsWith(".wav")) return "audio/wav";
+        if (lower.endsWith(".zip")) return "application/zip";
+        if (lower.endsWith(".flac")) return "audio/flac";
+        if (lower.endsWith(".ogg")) return "audio/ogg";
+        if (lower.endsWith(".aac")) return "audio/aac";
+        return "audio/mp4";
+    }
+
+    private void copy(File source, Uri uri) throws IOException {
+        try (InputStream input = new FileInputStream(source); OutputStream output = getContext().getContentResolver().openOutputStream(uri)) {
+            if (output == null) throw new IOException("The selected destination is unavailable.");
+            byte[] bytes = new byte[65536]; int count;
+            while ((count = input.read(bytes)) != -1) output.write(bytes, 0, count);
         }
     }
 
     @PluginMethod
     public void saveToDownloads(PluginCall call) {
-        String filePath = call.getString("path");
-        String displayName = call.getString("displayName");
-
-        if (filePath == null || filePath.isEmpty()) {
-            call.reject("Missing file path");
-            return;
+        if (Build.VERSION.SDK_INT < 29) {
+            Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT); intent.addCategory(Intent.CATEGORY_OPENABLE);
+            String name = safeName(call.getString("displayName"));
+            intent.setType(mime(name)); intent.putExtra(Intent.EXTRA_TITLE, name);
+            startActivityForResult(call, intent, "saveDocumentResult"); return;
         }
-
-        File srcFile = new File(filePath);
-        if (!srcFile.exists()) {
-            call.reject("Source file does not exist");
-            return;
-        }
-
-        if (displayName == null || displayName.isEmpty()) {
-            displayName = srcFile.getName();
-        }
-
-        try {
+        io(call, () -> {
+            File source = ownedPath(call.getString("path"), true);
+            String name = safeName(call.getString("displayName", source.getName()));
             ContentResolver resolver = getContext().getContentResolver();
-            Uri targetUri;
+            ContentValues values = new ContentValues(); values.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
+            values.put(MediaStore.MediaColumns.MIME_TYPE, mime(name)); values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AudioStudio");
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            Uri target = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (target == null) throw new IOException("Could not create the download entry.");
+            try {
+                copy(source, target); values.clear(); values.put(MediaStore.MediaColumns.IS_PENDING, 0); resolver.update(target, values, null, null);
+                JSObject result = new JSObject(); result.put("uri", target.toString()); call.resolve(result);
+            } catch (Exception error) { resolver.delete(target, null, null); throw error; }
+        });
+    }
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.MediaColumns.DISPLAY_NAME, displayName);
-                values.put(MediaStore.MediaColumns.MIME_TYPE, displayName.endsWith(".mp3") ? "audio/mpeg" : "audio/mp4");
-                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AudioStudio");
-                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
-
-                targetUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-                if (targetUri == null) throw new Exception("Failed to create download entry");
-
-                try (InputStream in = new FileInputStream(srcFile);
-                     OutputStream out = resolver.openOutputStream(targetUri)) {
-                    byte[] buffer = new byte[8192];
-                    int len;
-                    while ((len = in.read(buffer)) > 0) {
-                        out.write(buffer, 0, len);
-                    }
-                }
-
-                values.clear();
-                values.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                resolver.update(targetUri, values, null, null);
-            } else {
-                File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AudioStudio");
-                dir.mkdirs();
-                File dest = new File(dir, displayName);
-                try (InputStream in = new FileInputStream(srcFile);
-                     OutputStream out = new FileOutputStream(dest)) {
-                    byte[] buffer = new byte[8192];
-                    int len;
-                    while ((len = in.read(buffer)) > 0) {
-                        out.write(buffer, 0, len);
-                    }
-                }
-                targetUri = Uri.fromFile(dest);
-            }
-
-            JSObject res = new JSObject();
-            res.put("success", true);
-            res.put("uri", targetUri.toString());
-            res.put("savedName", displayName);
-            call.resolve(res);
-        } catch (Exception e) {
-            Log.e(TAG, "Error saving to downloads", e);
-            call.reject("Save to Downloads failed: " + e.getMessage());
-        }
+    @ActivityCallback
+    private void saveDocumentResult(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        Uri uri = result.getData() == null ? null : result.getData().getData();
+        if (result.getResultCode() != Activity.RESULT_OK || uri == null) { call.reject("Save cancelled."); return; }
+        io(call, () -> { copy(ownedPath(call.getString("path"), true), uri); JSObject response = new JSObject(); response.put("uri", uri.toString()); call.resolve(response); });
     }
 
     @PluginMethod
     public void shareFile(PluginCall call) {
-        String filePath = call.getString("path");
-        String title = call.getString("title", "Share Audio");
-
-        if (filePath == null || filePath.isEmpty()) {
-            call.reject("Missing file path");
-            return;
-        }
-
-        File file = new File(filePath);
-        if (!file.exists()) {
-            call.reject("File does not exist: " + filePath);
-            return;
-        }
-
         try {
-            Uri contentUri = FileProvider.getUriForFile(
-                    getContext(),
-                    getContext().getPackageName() + ".fileprovider",
-                    file
-            );
+            File file = ownedPath(call.getString("path"), true);
+            Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + ".fileprovider", file);
+            Intent intent = new Intent(Intent.ACTION_SEND); intent.setType(mime(file.getName()));
+            intent.putExtra(Intent.EXTRA_STREAM, uri); intent.setClipData(ClipData.newRawUri("Audio Studio export", uri));
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            getActivity().runOnUiThread(() -> {
+                try { getActivity().startActivity(Intent.createChooser(intent, call.getString("title", "Share Audio"))); call.resolve(); }
+                catch (RuntimeException e) { call.reject("No application can share this file."); }
+            });
+        } catch (Exception error) { call.reject(error.getMessage()); }
+    }
 
-            Intent shareIntent = new Intent(Intent.ACTION_SEND);
-            shareIntent.setType(filePath.endsWith(".mp3") ? "audio/mpeg" : "audio/mp4");
-            shareIntent.putExtra(Intent.EXTRA_STREAM, contentUri);
-            shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+    @PluginMethod
+    public void clearTemporaryCache(PluginCall call) {
+        io(call, () -> {
+            if (current.get() != null || !imports.isEmpty()) throw new IOException("Wait for audio processing and file imports to finish.");
+            long removed = 0;
+            File[] files = temporaryDir().listFiles();
+            if (files != null) for (File file : files) if (file.isFile()) {
+                long size = file.length(); if (!file.delete()) throw new IOException("A temporary file could not be removed."); removed += size;
+            }
+            JSObject result = new JSObject(); result.put("bytesRemoved", removed); call.resolve(result);
+        });
+    }
 
-            Intent chooser = Intent.createChooser(shareIntent, title);
-            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            getContext().startActivity(chooser);
-
-            call.resolve();
-        } catch (Exception e) {
-            Log.e(TAG, "Share failed", e);
-            call.reject("Share failed: " + e.getMessage());
-        }
+    @Override
+    protected void handleOnDestroy() {
+        AudioTranscoder task = current.get(); if (task != null) task.cancel();
+        encoderExecutor.shutdownNow(); ioExecutor.shutdownNow();
+        super.handleOnDestroy();
     }
 }

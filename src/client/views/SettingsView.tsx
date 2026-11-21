@@ -1,20 +1,15 @@
-import React, { useState, useEffect } from "react";
-import {
-  Settings,
-  Cpu,
-  Cloud,
-  Moon,
-  Sun,
-  ShieldCheck,
-  Trash2,
-  RefreshCw,
-  HardDrive,
-  Info
-} from "lucide-react";
+import React, { useState, useEffect, useRef } from "react";
+import { Settings, Cpu, Cloud, Moon, Sun, ShieldCheck, Trash2, RefreshCw, HardDrive, Info } from "lucide-react";
 import { toast } from "sonner";
-import { LibraryStorage, UserSettings } from "../services/libraryStorage";
-import { EngineInfo } from "../services/audioEngine";
-import { ApiClient } from "../services/apiClient";
+import { LibraryStorage, DEFAULT_SETTINGS, type UserSettings } from "../services/libraryStorage";
+import { AudioEngine, type EngineInfo } from "../services/audioEngine";
+import { MP3_BITRATES } from "../services/audioEncoding";
+import { ApiClient, normalizeBackendUrl, type BackendHealth } from "../services/apiClient";
+import { errorMessage } from "../services/errors";
+import { formatBytes } from "../services/format";
+import { APP_VERSION } from "../../shared/version";
+import type { ProjectIndex } from "../../server/projectStore";
+import { DEVICE_ONLY } from "../services/runtime";
 
 interface SettingsViewProps {
   engineInfo: EngineInfo | null;
@@ -22,251 +17,157 @@ interface SettingsViewProps {
   onToggleTheme: () => void;
 }
 
-export const SettingsView: React.FC<SettingsViewProps> = ({
-  engineInfo,
-  theme,
-  onToggleTheme
-}) => {
-  const [settings, setSettings] = useState<UserSettings>({
-    theme: "dark",
-    defaultBitrate: 192,
-    defaultFormat: "m4a",
-    cloudSyncEnabled: false,
-    reducedMotion: false
-  });
-
+export const SettingsView: React.FC<SettingsViewProps> = ({ engineInfo, theme, onToggleTheme }) => {
+  const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [saving, setSaving] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
-  const [backendHealth, setBackendHealth] = useState<string>("Checking…");
-
-  useEffect(() => {
-    loadSettings();
-    checkBackend();
-  }, []);
-
-  const loadSettings = async () => {
-    const s = await LibraryStorage.getSettings();
-    setSettings(s);
-  };
+  const [clearing, setClearing] = useState(false);
+  const [backend, setBackend] = useState<BackendHealth | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [backendDraft, setBackendDraft] = useState("");
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [hasToken, setHasToken] = useState(ApiClient.hasAccessToken());
+  const [lastSync, setLastSync] = useState("");
+  const [remoteIndex, setRemoteIndex] = useState<ProjectIndex | null>(null);
+  const savingRef = useRef(false);
+  const healthRequest = useRef(0);
+  const alive = useRef(true);
 
   const checkBackend = async () => {
+    const request = ++healthRequest.current;
+    setChecking(true);
     const health = await ApiClient.getHealth();
-    if (health.renderAvailable) {
-      setBackendHealth(`Connected (${health.mode})`);
-    } else {
-      setBackendHealth("Offline (Using 100% Local Device Mode)");
-    }
+    if (alive.current && request === healthRequest.current) { setBackend(health); setChecking(false); setHasToken(ApiClient.hasAccessToken()); }
   };
 
-  const updateSetting = async <K extends keyof UserSettings>(
-    key: K,
-    val: UserSettings[K]
-  ) => {
-    const updated = { ...settings, [key]: val };
-    setSettings(updated);
-    await LibraryStorage.saveSettings({ [key]: val });
-    toast.success("Preferences updated.");
-  };
-
-  const triggerCloudSync = async () => {
-    setIsSyncing(true);
-    toast.info("Synchronizing library indexes with cloud…");
-
+  const loadSettings = async () => {
+    setLoading(true); setLoadError("");
     try {
-      const tracks = await LibraryStorage.getAllTracks();
-      const metadataOnly = tracks.map((t) => ({
-        id: t.id,
-        title: t.title,
-        artist: t.artist,
-        album: t.album,
-        durationSec: t.durationSec,
-        format: t.format,
-        favorite: t.favorite,
-        dateAdded: t.dateAdded
-      }));
+      const value = await LibraryStorage.getSettings();
+      if (alive.current) { setSettings(value); setBackendDraft(value.backendUrl); }
+    } catch (error) { if (alive.current) setLoadError(errorMessage(error)); }
+    finally { if (alive.current) setLoading(false); }
+  };
 
-      const ok = await ApiClient.syncProjects({
-        timestamp: new Date().toISOString(),
-        trackCount: metadataOnly.length,
-        tracks: metadataOnly
-      });
+  useEffect(() => {
+    alive.current = true;
+    const invalidateHealth = () => { healthRequest.current++; };
+    void loadSettings(); void checkBackend();
+    const changed = (event: Event) => setSettings((event as CustomEvent<UserSettings>).detail);
+    const backendChanged = () => { setRemoteIndex(null); setLastSync(""); void checkBackend(); };
+    window.addEventListener("audio-studio:settings-changed", changed);
+    window.addEventListener("audio-studio:backend-changed", backendChanged);
+    return () => { alive.current = false; invalidateHealth(); window.removeEventListener("audio-studio:settings-changed", changed); window.removeEventListener("audio-studio:backend-changed", backendChanged); };
+  }, []);
 
-      if (ok) {
-        toast.success("Cloud synchronization complete!");
-      } else {
-        toast.info("Cloud sync server unavailable; local device storage remains active.");
+  const updateSetting = async <K extends keyof UserSettings>(key: K, value: UserSettings[K]) => {
+    if (savingRef.current) return;
+    savingRef.current = true; setSaving(true);
+    try { await LibraryStorage.saveSettings({ [key]: value }); toast.success("Preference saved."); }
+    catch (error) { toast.error(`Preference was not saved: ${errorMessage(error)}`); }
+    finally { savingRef.current = false; if (alive.current) setSaving(false); }
+  };
+
+  const saveConnection = async () => {
+    if (savingRef.current) return;
+    savingRef.current = true; setSaving(true);
+    try {
+      const url = normalizeBackendUrl(backendDraft);
+      const token = tokenDraft.trim();
+      if (token && (token.length < 32 || token.length > 256 || /\s/.test(token))) throw new Error("Use the backend owner token (32–256 characters, without whitespace).");
+      await LibraryStorage.saveSettings({ backendUrl: url });
+      ApiClient.setBaseUrl(url);
+      if (token) ApiClient.setAccessToken(token);
+      setBackendDraft(url); setTokenDraft(""); setHasToken(ApiClient.hasAccessToken());
+      await checkBackend(); toast.success("Backend preferences saved. Access tokens stay in this session only.");
+    } catch (error) { toast.error(errorMessage(error)); }
+    finally { savingRef.current = false; if (alive.current) setSaving(false); }
+  };
+
+  const syncIndex = async (read = false) => {
+    if (isSyncing || !backend?.syncAvailable || !hasToken || (!read && !settings.cloudSyncEnabled)) return;
+    setIsSyncing(true);
+    try {
+      if (read) setRemoteIndex(await ApiClient.getProjectIndex());
+      else {
+        const tracks = await LibraryStorage.getAllTracks();
+        const saved = await ApiClient.syncProjects(tracks.map(({ id, title, artist, album, durationSec, fileSize, format, favorite, dateAdded }) => ({ id, title, artist, album, durationSec, fileSize, format, favorite, dateAdded })));
+        setLastSync(saved.syncedAt); toast.success(`Saved an index of ${saved.trackCount} tracks to your authorized backend.`);
       }
-    } catch (err: any) {
-      toast.error(`Sync error: ${err.message}`);
-    } finally {
-      setIsSyncing(false);
-    }
+    } catch (error) { toast.error(`Index request failed: ${errorMessage(error)}`); }
+    finally { if (alive.current) setIsSyncing(false); }
   };
 
-  const clearCache = () => {
-    if (window.confirm("Clear device temporary audio cache? This will not delete imported tracks.")) {
-      toast.success("Device cache cleared.");
-    }
+  const clearCache = async () => {
+    if (clearing) return;
+    setClearing(true);
+    try { const removed = await AudioEngine.clearTemporaryCache(); toast.success(`Temporary cache cleared: ${formatBytes(removed)} removed.`); }
+    catch (error) { toast.error(`Cache was not cleared: ${errorMessage(error)}`); }
+    finally { if (alive.current) setClearing(false); }
   };
 
-  return (
-    <div className="settings-view-container">
-      <div className="settings-header glass-panel">
-        <div className="title-row">
-          <Settings size={22} className="text-accent" />
-          <h2>Studio Preferences & Engine Diagnostics</h2>
+  return <div className="settings-view-container">
+    <div className="settings-header glass-panel"><div className="title-row"><Settings size={22} className="text-accent" /><h2>Studio Preferences & Diagnostics</h2></div></div>
+    {loading && <p role="status" className="recovery-panel glass-panel">Loading preferences…</p>}
+    {loadError && <div role="alert" className="recovery-panel glass-panel"><p className="text-danger">Preferences could not be loaded: {loadError}</p><button type="button" className="btn-secondary" onClick={loadSettings}>Retry Loading</button></div>}
+    <div className="settings-cards-grid">
+      <section className="settings-card glass-panel">
+        <div className="card-heading"><Cpu size={18} className="text-accent" /><h3>Local Audio Engine</h3></div>
+        <div className="settings-list">
+          <div className="setting-item"><span>Platform</span><strong className="badge-pill">{engineInfo?.platform.toUpperCase() || "Checking…"}</strong></div>
+          <div className="setting-item"><span>Engine</span><span>{engineInfo?.engineName || "Initializing…"}</span></div>
+          <div className="setting-item"><span>Hardware AAC encoder</span><span>{engineInfo ? engineInfo.hardwareAcceleration ? "Available" : "Not reported; software encoders available" : "Checking…"}</span></div>
+          <div className="setting-item"><span>Reported CPU threads</span><span>{engineInfo?.availableCores ?? "Not reported"}</span></div>
+          <div className="setting-item"><span>Output formats</span><span>{engineInfo?.outputFormats.map((format) => format.toUpperCase()).join(", ") || "Checking…"}</span></div>
         </div>
-      </div>
+        <p className="card-desc"><ShieldCheck size={14} className="text-success" />{DEVICE_ONLY ? "All audio processing, metadata, analysis, and cover design run on your device. This APK has no Internet permission." : "Core audio processing stays on your device. Optional index uploads and AI prompts use the backend you configure."}</p>
+      </section>
 
-      <div className="settings-cards-grid">
-        {/* Hardware Engine Status */}
-        <div className="settings-card glass-panel">
-          <div className="card-heading">
-            <Cpu size={18} className="text-accent" />
-            <h3>Audio Processing Hardware</h3>
-          </div>
-          <div className="settings-list">
-            <div className="setting-item">
-              <span>Platform</span>
-              <strong className="badge-pill">{engineInfo?.platform.toUpperCase() || "WEB"}</strong>
-            </div>
-            <div className="setting-item">
-              <span>Active Engine</span>
-              <span>{engineInfo?.engineName || "Local CPU"}</span>
-            </div>
-            <div className="setting-item">
-              <span>Hardware Acceleration</span>
-              <span className="text-success">
-                {engineInfo?.hardwareAcceleration ? "Active (DSP/MediaCodec)" : "Standard"}
-              </span>
-            </div>
-            <div className="setting-item">
-              <span>CPU Cores Allocated</span>
-              <span>{engineInfo?.availableCores || 4} Hardware Threads</span>
-            </div>
-            <div className="setting-item">
-              <span>Audio Privacy</span>
-              <span className="text-success">
-                <ShieldCheck size={14} style={{ display: "inline", verticalAlign: "middle" }} /> 100% Local (Zero uploads)
-              </span>
-            </div>
-          </div>
+      <fieldset className="settings-card glass-panel" disabled={loading || saving}>
+        <legend className="sr-only">Default audio and interface settings</legend>
+        <div className="card-heading"><HardDrive size={18} className="text-accent" /><h3>Audio & Interface Defaults</h3></div>
+        <div className="settings-list">
+          <div className="setting-item-row"><label htmlFor="def-bitrate">Compressed bitrate</label><select id="def-bitrate" value={settings.defaultBitrate} className="select-input-sm" onChange={(event) => updateSetting("defaultBitrate", Number(event.target.value))}>{MP3_BITRATES.map((bitrate) => <option key={bitrate} value={bitrate}>{bitrate} kbps</option>)}</select></div>
+          <div className="setting-item-row"><label htmlFor="def-format">Output format</label><select id="def-format" value={settings.defaultFormat} className="select-input-sm" onChange={(event) => updateSetting("defaultFormat", event.target.value as UserSettings["defaultFormat"])}>
+            <option value="mp3">MP3</option><option value="m4a" disabled={!engineInfo?.outputFormats.includes("m4a")}>M4A / AAC{engineInfo && !engineInfo.outputFormats.includes("m4a") ? " (unavailable here)" : ""}</option><option value="wav">WAV (16-bit PCM)</option>
+          </select></div>
+          <p className="card-desc">WAV bitrate follows its sample rate and channels. If a saved encoder is unavailable on this device, the compressor uses MP3.</p>
+          <div className="setting-item-row"><span>Interface theme</span><button type="button" className="btn-secondary btn-sm" onClick={onToggleTheme}>{theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}<span>{theme === "dark" ? "Light Mode" : "Dark Mode"}</span></button></div>
+          <div className="setting-item-row"><label htmlFor="reduced-motion">Reduce interface motion</label><input id="reduced-motion" type="checkbox" checked={settings.reducedMotion} onChange={(event) => updateSetting("reducedMotion", event.target.checked)} /></div>
+          <p className="card-desc">Your system's reduced-motion preference is also respected.</p>
         </div>
+      </fieldset>
 
-        {/* Defaults & Audio Output */}
-        <div className="settings-card glass-panel">
-          <div className="card-heading">
-            <HardDrive size={18} className="text-accent" />
-            <h3>Default Audio Settings</h3>
-          </div>
-          <div className="settings-list">
-            <div className="setting-item-row">
-              <label htmlFor="def-bitrate">Default Compressor Bitrate</label>
-              <select
-                id="def-bitrate"
-                value={settings.defaultBitrate}
-                onChange={(e) => updateSetting("defaultBitrate", Number(e.target.value))}
-                className="select-input-sm"
-              >
-                <option value={320}>320 kbps (Studio Master)</option>
-                <option value={256}>256 kbps (High Quality)</option>
-                <option value={192}>192 kbps (Broadcast)</option>
-                <option value={128}>128 kbps (Standard)</option>
-                <option value={96}>96 kbps (Compact)</option>
-              </select>
-            </div>
-
-            <div className="setting-item-row">
-              <label htmlFor="def-format">Default Output Format</label>
-              <select
-                id="def-format"
-                value={settings.defaultFormat}
-                onChange={(e) => updateSetting("defaultFormat", e.target.value as any)}
-                className="select-input-sm"
-              >
-                <option value="m4a">M4A / AAC (Hardware Accelerated)</option>
-                <option value="mp3">MP3</option>
-                <option value="wav">WAV (Lossless)</option>
-              </select>
-            </div>
-
-            <div className="setting-item-row">
-              <label>Interface Theme</label>
-              <button
-                type="button"
-                className="btn-secondary btn-sm"
-                onClick={onToggleTheme}
-              >
-                {theme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
-                <span>{theme === "dark" ? "Light Mode" : "Dark Mode"}</span>
-              </button>
-            </div>
-          </div>
+      {!DEVICE_ONLY && <section className="settings-card glass-panel">
+        <div className="card-heading"><Cloud size={18} className="text-accent" /><h3>Optional Backend & Library Index</h3></div>
+        <p className="card-desc">Sync titles, artists, formats, sizes, and favorites to your private backend index. This does not upload or restore audio files, artwork, or preferences.</p>
+        <fieldset className="form-fields" disabled={loading || saving || isSyncing}>
+          <legend className="sr-only">Backend connection</legend>
+          <div className="form-group"><label htmlFor="backend-url">Backend URL (HTTPS)</label><input id="backend-url" type="url" className="text-input" placeholder="https://your-backend.example" value={backendDraft} onChange={(event) => setBackendDraft(event.target.value)} autoComplete="off" /></div>
+          <div className="form-group"><label htmlFor="backend-token">Owner access token (this session only)</label><input id="backend-token" type="password" className="text-input" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} autoComplete="off" maxLength={256} placeholder={hasToken ? "Session token is set" : "Token from your backend administrator"} /></div>
+          <button type="button" className="btn-secondary" onClick={saveConnection}>{saving ? "Saving…" : "Save Backend Connection"}</button>
+          {hasToken && <button type="button" className="btn-secondary btn-sm" onClick={() => { ApiClient.setAccessToken(""); setHasToken(false); setTokenDraft(""); }}>Clear Session Token</button>}
+        </fieldset>
+        <div className="setting-item"><span>Backend status</span><span role="status">{checking ? "Checking…" : backend?.ok ? `Connected (${backend.mode}, v${backend.version})` : ApiClient.isConfigured() ? "Unavailable; local processing remains available" : "Not configured; local-only mode"}</span></div>
+        <button type="button" className="btn-secondary btn-sm" disabled={checking} onClick={checkBackend}><RefreshCw size={14} />Check Connection</button>
+        <div className="setting-item-row"><label htmlFor="enable-index-sync">Allow metadata index upload</label><input id="enable-index-sync" type="checkbox" checked={settings.cloudSyncEnabled} disabled={loading || saving || isSyncing} onChange={(event) => updateSetting("cloudSyncEnabled", event.target.checked)} /></div>
+        <div className="header-actions">
+          <button type="button" className="btn-secondary" disabled={isSyncing || !settings.cloudSyncEnabled || !backend?.syncAvailable || !hasToken} onClick={() => syncIndex()}><RefreshCw size={14} className={isSyncing ? "animate-spin" : ""} />{isSyncing ? "Requesting…" : "Sync Metadata Now"}</button>
+          <button type="button" className="btn-secondary" disabled={isSyncing || !backend?.syncAvailable || !hasToken} onClick={() => syncIndex(true)}>View Remote Index</button>
         </div>
+        {(!backend?.syncAvailable || !hasToken) && <p className="card-desc">Index operations require an authorized backend with persistent index storage enabled.</p>}
+        {lastSync && <p className="card-desc">Last confirmed save: {new Date(lastSync).toLocaleString()}</p>}
+        {remoteIndex && <div className="remote-index" role="status"><p>{remoteIndex.tracks.length} remote track(s). Audio files stay on their originating device.</p><ul>{remoteIndex.tracks.slice(0, 20).map((track) => <li key={track.id}>{track.title || "Untitled"} · {track.artist || "Unknown Artist"} · {track.format}</li>)}</ul>{remoteIndex.tracks.length > 20 && <p>Showing the first 20 entries.</p>}</div>}
+      </section>}
 
-        {/* Optional Cloud Synchronization */}
-        <div className="settings-card glass-panel">
-          <div className="card-heading">
-            <Cloud size={18} className="text-accent" />
-            <h3>Cloud Synchronization (Optional)</h3>
-          </div>
-          <p className="card-desc">
-            Audio Studio keeps your audio files completely on your device. Optionally backup your library
-            indexes and project preferences to Render backend.
-          </p>
-          <div className="settings-list">
-            <div className="setting-item">
-              <span>Backend Status</span>
-              <span>{backendHealth}</span>
-            </div>
-            <div className="setting-item-row">
-              <label>Enable Cloud Metadata Sync</label>
-              <input
-                type="checkbox"
-                checked={settings.cloudSyncEnabled}
-                onChange={(e) => updateSetting("cloudSyncEnabled", e.target.checked)}
-                className="toggle-checkbox"
-              />
-            </div>
-
-            <button
-              type="button"
-              className="btn-secondary w-full mt-3"
-              onClick={triggerCloudSync}
-              disabled={isSyncing}
-            >
-              <RefreshCw size={14} className={isSyncing ? "animate-spin" : ""} />
-              <span>{isSyncing ? "Syncing Indexes…" : "Sync Metadata Now"}</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Maintenance & App Info */}
-        <div className="settings-card glass-panel">
-          <div className="card-heading">
-            <Info size={18} className="text-accent" />
-            <h3>System Diagnostics & Cache</h3>
-          </div>
-          <div className="settings-list">
-            <div className="setting-item">
-              <span>Version</span>
-              <span>Audio Studio v2.0.0</span>
-            </div>
-            <div className="setting-item">
-              <span>Storage Driver</span>
-              <span>IndexedDB / Scoped MediaStore</span>
-            </div>
-
-            <button
-              type="button"
-              className="btn-secondary btn-danger-hover w-full mt-4"
-              onClick={clearCache}
-            >
-              <Trash2 size={14} />
-              <span>Clear Temporary Cache</span>
-            </button>
-          </div>
-        </div>
-      </div>
+      <section className="settings-card glass-panel">
+        <div className="card-heading"><Info size={18} className="text-accent" /><h3>Storage & Maintenance</h3></div>
+        <div className="settings-list"><div className="setting-item"><span>Version</span><span>Audio Studio v{APP_VERSION}</span></div><div className="setting-item"><span>Library storage</span><span>IndexedDB{AudioEngine.isNative() ? " + private native exports" : ""}</span></div></div>
+        <p className="card-desc">Clear temporary native staging files and runtime caches. Imported library tracks, persistent exports, preferences, and the offline app shell are retained.</p>
+        <button type="button" className="btn-secondary" disabled={clearing} onClick={clearCache}><Trash2 size={14} />{clearing ? "Clearing…" : "Clear Temporary Cache"}</button>
+      </section>
     </div>
-  );
+  </div>;
 };

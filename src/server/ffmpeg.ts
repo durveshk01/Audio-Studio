@@ -14,17 +14,19 @@ function run(command: string, args: string[], onStderr?: (line: string) => void)
     const child = spawn(command, args, { windowsHide: true });
     let stdout = "";
     let stderr = "";
+    const timeout = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Audio processing exceeded the time limit.")); }, 10 * 60 * 1000);
 
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      stdout = (stdout + chunk.toString()).slice(-1024 * 1024);
     });
     child.stderr.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
-      stderr += text;
+      stderr = (stderr + text).slice(-64 * 1024);
       onStderr?.(text);
     });
-    child.on("error", reject);
+    child.on("error", (error) => { clearTimeout(timeout); reject(error); });
     child.on("close", (code) => {
+      clearTimeout(timeout);
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(stderr || `${command} exited with code ${code}`));
     });

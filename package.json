@@ -1,23 +1,33 @@
 {
   "name": "audiocompress",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "concurrently \"vite --host 0.0.0.0\" \"tsx watch src/server/index.ts\"",
-    "build": "tsc --noEmit && vite build && tsup src/server/index.ts --format esm --platform node --target node20 --out-dir dist/server --clean",
-    "build:client": "tsc --noEmit && vite build",
-    "android:sync": "npm run build && cap sync android",
-    "android:apk": "npm run build && cap sync android && cd android && gradlew.bat assembleDebug",
+    "build": "npm run build:client && npm run build:server",
+    "build:client": "tsc --noEmit && vite build && node scripts/offline-shell.mjs",
+    "build:android": "tsc --noEmit && vite build --mode android && node scripts/offline-shell.mjs",
+    "build:server": "tsup src/server/index.ts --format esm --platform node --target node22 --out-dir dist/server --clean",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings=0",
+    "android:sync": "npm run build:android && cap sync android",
+    "android:signing": "node scripts/android-signing.mjs",
+    "android:check": "npm run android:sync && node scripts/android-build.mjs --checks-only",
+    "android:apk": "npm run android:sync && node scripts/android-build.mjs --release",
+    "android:debug": "npm run android:sync && node scripts/android-build.mjs --debug",
+    "android:test": "node scripts/android-test.mjs",
     "start": "node dist/server/index.js",
     "test": "vitest run",
+    "test:e2e": "npm run build && playwright test",
     "verify:audio": "tsx scripts/verify-audio-processing.ts",
     "verify:ffmpeg": "tsx scripts/verify-ffmpeg.ts"
   },
   "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
     "@capacitor/android": "^8.6.0",
+    "@capacitor/app": "^8.1.2",
     "@capacitor/core": "^8.6.0",
-    "archiver": "^7.0.1",
     "browser-id3-writer": "^6.4.0",
     "cors": "^2.8.6",
     "dotenv": "^16.4.7",
@@ -26,35 +36,45 @@
     "helmet": "^8.3.0",
     "jszip": "^3.10.2",
     "lucide-react": "^0.468.0",
-    "multer": "^1.4.5-lts.1",
+    "mp3tag.js": "^3.17.1",
+    "multer": "^2.5.0",
+    "music-metadata": "^12.3.5",
     "nanoid": "^5.0.9",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "sonner": "^1.7.0"
+    "sonner": "^1.7.0",
+    "yazl": "^3.3.1"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.14.0",
     "@capacitor/cli": "^8.6.0",
-    "@types/archiver": "^6.0.4",
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.65.0",
     "@types/cors": "^2.8.19",
+    "@types/dom-webcodecs": "^0.1.19",
     "@types/express": "^5.0.0",
     "@types/multer": "^1.4.12",
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.17",
     "@types/react-dom": "^18.3.5",
+    "@types/yazl": "^3.3.1",
     "@vitejs/plugin-react": "^6.0.2",
     "concurrently": "^9.1.2",
+    "eslint": "^10.14.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "fake-indexeddb": "^6.2.8",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
+    "typescript-eslint": "^8.72.1",
     "vite": "^8.0.16",
     "vitest": "^4.1.8"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12.0"
   },
   "overrides": {
-    "readdir-glob": {
-      "minimatch": "^11.0.1"
-    }
+    "minimatch": "^11.0.1",
+    "glob": "^14.0.2"
   }
 }

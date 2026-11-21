@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { config } from "./config";
-import { formatFromFilename, sanitizeFilename } from "./utils";
+import { formatFromFilename, sanitizeFilename, uniqueArchiveName } from "./utils";
 
 describe("Server Utilities & Configuration", () => {
   it("verifies server config limits and defaults", () => {
@@ -22,5 +22,13 @@ describe("Server Utilities & Configuration", () => {
     expect(formatFromFilename("TRACK.MP3")).toBe("mp3");
     expect(formatFromFilename("unsupported.txt")).toBeNull();
     expect(formatFromFilename("video.mp4")).toBeNull();
+  });
+
+  it("retains every ZIP entry despite case and pre-existing suffix collisions", () => {
+    const used = new Set<string>();
+    const names = ["song.mp3", "SONG.mp3", "song (1).mp3", "song.mp3"].map((name) => uniqueArchiveName(name, used));
+    expect(new Set(names.map((name) => name.toLowerCase())).size).toBe(4);
+    expect(names[0]).toBe("song.mp3");
+    expect(names[3]).toBe("song (2).mp3");
   });
 });

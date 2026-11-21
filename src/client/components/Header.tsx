@@ -45,7 +45,7 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="engine-text">
             {engineInfo?.isNativeDevicePowered
               ? engineInfo.platform === "android"
-                ? "Phone CPU / DSP Hardware"
+                ? "Local Android Audio"
                 : "Local Browser CPU"
               : "Local Engine"}
           </span>

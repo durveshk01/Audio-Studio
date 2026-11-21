@@ -1,4 +1,4 @@
-import archiver from "archiver";
+import { ZipFile } from "yazl";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -7,11 +7,21 @@ import { nanoid } from "nanoid";
 import { config } from "./config.js";
 import { compressAudio, probeAudio } from "./ffmpeg.js";
 import { Job, ProcessedAudio, UploadedAudio } from "./types.js";
-import { compressedName, ensureDir, MB, removeDir, toPublicJob } from "./utils.js";
+import { compressedName, ensureDir, MB, removeDir, toPublicJob, uniqueArchiveName } from "./utils.js";
 
 const jobs = new Map<string, Job>();
 const subscribers = new Map<string, Set<(payload: string) => void>>();
 const MAX_JOBS = 200;
+let activeJobs = 0;
+const pendingJobs: string[] = [];
+
+function drainQueue() {
+  while (activeJobs < config.maxConcurrentJobs && pendingJobs.length) {
+    const id = pendingJobs.shift()!;
+    activeJobs++;
+    void processJob(id).finally(() => { activeJobs--; drainQueue(); });
+  }
+}
 
 function cleanupOldJobs() {
   if (jobs.size < MAX_JOBS) return;
@@ -33,6 +43,9 @@ function cleanupOldJobs() {
 
 export function createJob(files: UploadedAudio[], targetMb: number, force: boolean, dirs: { uploadDir: string; outputDir: string }) {
   cleanupOldJobs();
+  if (pendingJobs.length >= config.maxQueuedJobs || jobs.size >= MAX_JOBS) {
+    throw Object.assign(new Error("The processing queue is full. Please try again later."), { status: 503 });
+  }
   const job: Job = {
     id: nanoid(12),
     status: "queued",
@@ -47,7 +60,8 @@ export function createJob(files: UploadedAudio[], targetMb: number, force: boole
   };
 
   jobs.set(job.id, job);
-  void processJob(job.id);
+  pendingJobs.push(job.id);
+  queueMicrotask(drainQueue);
   return job;
 }
 
@@ -89,8 +103,8 @@ async function processJob(jobId: string) {
 
     const cpus = os.cpus()?.length || 1;
     // Scale concurrency with actual available cores (max 4, min 1)
-    const concurrency = Math.max(1, Math.min(cpus, 4, job.files.length));
-    const threadsPerFfmpeg = Math.max(1, Math.floor(cpus / concurrency));
+    const concurrency = 1;
+    const threadsPerFfmpeg = Math.max(1, Math.min(config.ffmpegThreads, Math.floor(cpus / config.maxConcurrentJobs)));
     const queue = [...job.files];
     
     console.log(`Concurrency: ${concurrency}, Threads per FFmpeg: ${threadsPerFfmpeg}`);
@@ -100,7 +114,7 @@ async function processJob(jobId: string) {
         const file = queue.shift();
         if (!file) break;
 
-        console.log(`  Processing file ${file.id}: ${file.originalName}`);
+        console.log(`Processing file ${file.id}`);
         job.currentFileId = file.id;
         file.status = "processing";
         file.progress = 3;
@@ -111,7 +125,6 @@ async function processJob(jobId: string) {
           const outName = compressedName(file.originalName);
           const outPath = path.join(job.outputDir, `${file.id}-${outName}`);
           
-          console.log(`    Probing ${file.inputPath}`);
           const probe = await probeAudio(file.inputPath);
           file.duration = probe.duration;
 
@@ -148,9 +161,9 @@ async function processJob(jobId: string) {
             console.log(`    Completed: ${result.outputSize} bytes`);
           }
         } catch (error) {
-          console.error(`    Error processing file ${file.id}:`, error);
+          console.error(`Audio processing failed for file ${file.id}`);
           file.status = "failed";
-          file.error = error instanceof Error ? error.message : "Could not process this file.";
+          file.error = "Could not process this audio. Check the file format and selected target size.";
           file.progress = 100;
         }
         job.completed += 1;
@@ -178,36 +191,24 @@ async function createZip(job: Job) {
   if (success.length === 0) return;
 
   // Deduplicate archive entry names to prevent overwrites
-  const nameCount = new Map<string, number>();
-  const getUniqueName = (name: string) => {
-    const count = nameCount.get(name) ?? 0;
-    nameCount.set(name, count + 1);
-    if (count === 0) return name;
-    const dot = name.lastIndexOf(".");
-    const base = dot > 0 ? name.slice(0, dot) : name;
-    const ext = dot > 0 ? name.slice(dot) : "";
-    return `${base} (${count})${ext}`;
-  };
+  const usedNames = new Set<string>();
 
   const zipPath = path.join(job.outputDir, `${job.id}-audiocompress.zip`);
   await new Promise<void>((resolve, reject) => {
     const output = fs.createWriteStream(zipPath);
-    const archive = archiver("zip", { zlib: { level: 1 } });
+    const archive = new ZipFile();
 
     output.on("close", resolve);
     output.on("error", reject);
     archive.on("error", reject);
-    archive.on("warning", (err) => {
-      if (err.code !== "ENOENT") reject(err);
-    });
-    archive.pipe(output);
+    archive.outputStream.pipe(output);
 
     for (const file of success) {
-      const entryName = getUniqueName(file.outputName ?? compressedName(file.originalName));
-      archive.file(file.outputPath as string, { name: entryName });
+      const entryName = uniqueArchiveName(file.outputName ?? compressedName(file.originalName), usedNames);
+      archive.addFile(file.outputPath as string, entryName, { compressionLevel: 1 });
     }
 
-    archive.finalize().catch(reject);
+    archive.end();
   });
 
   job.zipPath = zipPath;

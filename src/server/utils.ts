@@ -21,6 +21,14 @@ export function compressedName(name: string) {
   return `${parsed.name}-compressed${parsed.ext.toLowerCase()}`;
 }
 
+export function uniqueArchiveName(name: string, used: Set<string>): string {
+  const parsed = path.parse(name);
+  let candidate = name, count = 1;
+  while (used.has(candidate.toLowerCase())) candidate = `${parsed.name} (${count++})${parsed.ext}`;
+  used.add(candidate.toLowerCase());
+  return candidate;
+}
+
 export function formatFromFilename(name: string): AudioFormat | null {
   const ext = path.extname(name).toLowerCase();
   if (ext === ".mp3") return "mp3";
